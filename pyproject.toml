@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemos-charon"
+version = "0.1.0"
+description = "Extracted CHARON portability subsystem for the Mnemos namespace: the MPF (Memory Portability Format) standard, import/export, migrate-in adapters for foreign memory systems, and Docling document ingestion."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mnemos-core",
+    "fastapi",
+    "starlette",
+    "pydantic",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+# IBM Docling document ingestion (PDF/DOCX/HTML -> memories). The
+# routes/document_import.py + tools/docling_import.py path is soft-gated and
+# only mounts when docling is importable, so this is the one heavy extra.
+docling = ["docling>=2.5.0", "docling-core>=2.0.0", "pillow>=10.0.0"]
+test = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "mnemos.api",
+    "mnemos.api.routes",
+    "mnemos.domain.portability",
+    "mnemos.domain.portability.*",
+    "mnemos.tools",
+    "mnemos.tools.adapters",
+    "mnemos.tools.charon_peers",
+]
+namespaces = true
+
+[tool.setuptools.package-data]
+"mnemos.domain.portability" = ["vendor/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
