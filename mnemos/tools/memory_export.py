@@ -183,6 +183,26 @@ def cmd_jsonl(args: argparse.Namespace) -> None:
     print(f"Wrote {len(records)} records as JSONL → {out}{suffix}")
 
 
+def cmd_mif(args: argparse.Namespace) -> None:
+    """Export memories as a MIF 1.0 bundle (a directory of `<type>/<uuid>.md`
+    concept files + a manifest), via the mnemos-core CHARON MIF primitives.
+    `--out` is the bundle directory."""
+    from mnemos.portability import charon as mif_charon
+
+    memories = _fetch_memories_flat(
+        args.endpoint,
+        args.api_key,
+        args.category,
+        args.limit,
+        owner_id=getattr(args, "owner_id", None),
+        namespace=getattr(args, "namespace", None),
+    )
+    manifest = mif_charon.export_bundle(memories, Path(args.out))
+    print(
+        f"Wrote {manifest['count']} concepts as a MIF {manifest['mif_version']} bundle → {args.out}"
+    )
+
+
 def cmd_markdown(args: argparse.Namespace) -> None:
     try:
         from mnemos.tools.export_memories_for_docling import export_memories_markdown
@@ -309,6 +329,11 @@ def _build_parser() -> argparse.ArgumentParser:
              "See json subcommand help.",
     )
     p_jsonl.set_defaults(func=cmd_jsonl)
+
+    p_mif = sub.add_parser("mif", help="Emit a MIF 1.0 bundle (directory of concept files + manifest)")
+    _add_common(p_mif)
+    _add_fetch_args(p_mif)
+    p_mif.set_defaults(func=cmd_mif)
 
     p_md = sub.add_parser("markdown", help="Emit Markdown (human-readable)")
     _add_common(p_md)
