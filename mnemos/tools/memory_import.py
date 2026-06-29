@@ -1085,6 +1085,47 @@ class TextImporter(BaseImporter):
 
 
 # ---------------------------------------------------------------------------
+# MIF bundle import
+# ---------------------------------------------------------------------------
+
+class MifImporter(BaseImporter):
+    """Import a MIF 1.0 bundle (directory of concept files) into MNEMOS, via the
+    mnemos-core CHARON MIF primitives. The concept's base type (``mif_type``) is
+    folded into ``metadata.mif_type`` so it persists on every backend (Phase 2a)
+    and round-trips on a later export."""
+
+    def __init__(self, source: str, **kwargs):
+        super().__init__(**kwargs)
+        self.source = source
+
+    def run(self) -> dict:
+        from mnemos.portability import charon as mif_charon
+
+        memories = mif_charon.import_bundle(self.source)
+        payloads = []
+        for mem in memories:
+            mif_type = mem.pop("mif_type", None)
+            meta = mem.get("metadata") if isinstance(mem.get("metadata"), dict) else {}
+            if mif_type:
+                meta = {**meta, "mif_type": mif_type}
+            payload = {
+                "content": mem.get("content", ""),
+                "category": mem.get("category") or self.category,
+                "namespace": self.namespace or mem.get("namespace") or "default",
+            }
+            if mem.get("subcategory"):
+                payload["subcategory"] = mem["subcategory"]
+            if self.owner_id:
+                payload["owner_id"] = self.owner_id
+            if meta:
+                payload["metadata"] = meta
+            payloads.append(payload)
+        ok, fail = self._post(payloads)
+        print(f"Imported {ok} concept(s) from MIF bundle {self.source} ({fail} failed)")
+        return {"imported": ok, "failed": fail}
+
+
+# ---------------------------------------------------------------------------
 # Stats command
 # ---------------------------------------------------------------------------
 
@@ -1229,6 +1270,12 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Recurse into sub-directories")
     _add_common_args(p_txt)
 
+    # --- mif ---
+    p_mif = sub.add_parser("mif", help="Import a MIF 1.0 bundle (directory of concept files)")
+    p_mif.add_argument("--source", required=True, metavar="DIR",
+                       help="MIF bundle directory to import")
+    _add_common_args(p_mif)
+
     # --- stats ---
     p_stats = sub.add_parser("stats", help="Show MNEMOS memory statistics")
     p_stats.add_argument("--endpoint", default="http://localhost:5002",
@@ -1301,6 +1348,17 @@ def main(argv=None):
             recursive=args.recursive,
             dry_run=args.dry_run,
             **common,
+        )
+        importer.run()
+
+    elif args.subcommand == "mif":
+        importer = MifImporter(
+            source=args.source,
+            endpoint=args.endpoint,
+            api_key=args.api_key,
+            dry_run=getattr(args, "dry_run", False),
+            owner_id=getattr(args, "owner_id", None),
+            namespace=getattr(args, "namespace", None),
         )
         importer.run()
 
