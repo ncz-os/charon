@@ -7,15 +7,30 @@ installable `mnemos.*` namespace distribution (PEP 420) that overlays onto
 
 ## What's inside
 
-- **MPF — Memory Portability Format** (`mnemos.domain.portability`): the open
-  import/export schema (`vendor/mpf-v0.2.json`), serializers, ID/version
-  topology, and the import/export orchestration.
-- **MPF API** (`mnemos.api.routes.portability`, `…routes.ingest`): `/v1/export`,
-  `/v1/import`, and universal ingest.
+- **MIF 1.0 — the portability format.** The native export/import format is the
+  [Memory Interchange Format](https://mif-spec.dev) (MIF 1.0). A MIF bundle is a
+  directory of `<conceptType>/<uuid>.md` concept files (Markdown body + JSON-LD
+  front matter) plus a `mif-manifest.json`. The MIF mapping and bundle
+  read/write primitives live in **`mnemos.portability` in `mnemos-core`**
+  (`mnemos.portability.charon` → `export_bundle` / `import_bundle`); CHARON
+  drives them from the CLI and route surface.
+- **MIF export/import CLI** (`mnemos.tools.memory_export`,
+  `mnemos.tools.memory_import` — the `mif` subcommand). Surfaced through the
+  core CLI as `mnemos export --format mif <dir>` and
+  `mnemos import <dir> --from mif`.
+- **MPF — Memory Portability Format (legacy)** (`mnemos.domain.portability`):
+  the older schema-versioned JSON envelope (`vendor/mpf-v0.2.json`), serializers,
+  ID/version topology, and import/export orchestration. MPF is retired as the
+  *preferred* emit format in favour of MIF, but remains supported — and is still
+  **read** as a migration source. The `/v1/export`, `/v1/import`, and universal
+  ingest routes (`mnemos.api.routes.portability`, `…routes.ingest`) live here.
+- **MPF → MIF migration** (`mnemos.tools.mpf_to_mif`): an offline tool that
+  converts an existing MPF dump into a MIF 1.0 bundle, so deployments on the
+  legacy format graduate to MIF without a live re-export.
 - **Migrate-in adapters** (`mnemos.tools.adapters.*`): read foreign memory
   systems — `mem0`, `letta`, `graphiti`, `cognee`, `mempalace` — via their
-  on-disk/HTTP formats (stdlib only, no vendor SDKs required) and emit MPF so
-  users can migrate **to** Mnemos.
+  on-disk/HTTP formats (stdlib only, no vendor SDKs required) so users can
+  migrate **to** Mnemos.
 - **Document ingestion** (`mnemos.api.routes.document_import`,
   `mnemos.tools.docling_import`): IBM Docling conversion of PDF/DOCX/HTML into
   memories. Optional — install the `docling` extra.
@@ -23,7 +38,7 @@ installable `mnemos.*` namespace distribution (PEP 420) that overlays onto
 ## Install
 
 ```bash
-pip install mnemos-core mnemos-charon            # MPF + adapters
+pip install mnemos-core mnemos-charon            # MIF + MPF + adapters
 pip install "mnemos-charon[docling]"             # + IBM Docling document import
 ```
 
@@ -34,8 +49,15 @@ when absent, core boots without them.
 
 ## Relationship to core
 
-CHARON depends on `mnemos-core` (one direction only). The SQL/data-access for
-the MPF flow stays in core (`mnemos.db.portability_repo` + the persistence
-backends own the schema and queries); CHARON owns validation, orchestration,
-adapters, and the route surface. The `migrations_charon_trigger_guard.sql`
-schema migration is applied by core's migration runner.
+CHARON depends on `mnemos-core` (one direction only). The MIF 1.0 mapping and
+bundle primitives live in **core** (`mnemos.portability`), as do the SQL/data
+access for the portability flow (`mnemos.db.portability_repo` + the persistence
+backends own the schema and queries). CHARON owns the MPF schema and
+orchestration, the MIF/MPF CLI tooling (`mnemos.tools.memory_export` /
+`memory_import` / `mpf_to_mif`), the migrate-in adapters, document ingestion,
+and the route surface. The `migrations_charon_trigger_guard.sql` schema
+migration is applied by core's migration runner.
+
+> A MIF-native REST portability surface (`/v1/export`, `/v1/import` emitting and
+> accepting MIF bundles directly) is a follow-up; today those routes speak MPF
+> and the MIF path is exercised through the CLI primitives.
