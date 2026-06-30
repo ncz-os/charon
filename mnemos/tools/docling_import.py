@@ -41,6 +41,7 @@ class DoclingImporter:
         dry_run: bool = False,
         owner_id: str = None,
         namespace: str = None,
+        emit_mif: str = None,
     ):
         """
         Args:
@@ -61,10 +62,24 @@ class DoclingImporter:
         self.dry_run = dry_run
         self.owner_id = owner_id
         self.namespace = namespace
+        # When set, ingested chunks are NOT POSTed to the API; they are collected
+        # and written as a MIF 1.0 bundle (directory of conformant concept files)
+        # under this path. Lets Docling document ingest produce portable MIF
+        # directly, alongside the existing MNEMOS-API ingest path.
+        self.emit_mif = emit_mif
+        self.collected: list[dict] = []
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mif_memory_id(mem: dict) -> str:
+        """Stable source id for a chunk so re-ingesting the same document yields
+        the same MIF concept ``@id`` (memory_to_concept hashes this to a UUIDv5)."""
+        meta = mem.get("metadata") or {}
+        src = meta.get("source_path") or meta.get("source_file") or "doc"
+        return f"docling:{src}#{meta.get('chunk_index', 0)}"
 
     def import_file(self, path: Path) -> list:
         """Extract, chunk, and (optionally) POST a single file.
@@ -114,9 +129,69 @@ class DoclingImporter:
                       f"{preview!r} | meta={mem['metadata']}")
             return memories
 
+        if self.emit_mif is not None:
+            # MIF mode: collect chunks (with a stable source id) for a bundle
+            # written once at the end of the run — do not POST to the API.
+            # `is not None` (not truthiness): an explicitly-set DIR must never
+            # silently fall through to the POST path.
+            for mem in memories:
+                # Assign unconditionally so the advertised stable Docling source
+                # id holds even if an upstream chunk ever carries its own id.
+                mem["id"] = self._mif_memory_id(mem)
+            self.collected.extend(memories)
+            print(f"  MIF  {path.name}: {total} chunk(s) staged for the MIF bundle")
+            return memories
+
         ok, fail = self._post_batch(memories)
         print(f"  Done  {path.name}: {ok} imported, {fail} failed")
         return memories
+
+    def write_mif_bundle(self) -> dict:
+        """Write all collected chunks as a MIF 1.0 bundle.
+
+        Delegates to the canonical MIF mapper/serializer in mnemos-core
+        (``mnemos.portability.charon.export_bundle``), which converts each chunk
+        to a MIF concept, validates it against the published MIF JSON Schema, and
+        writes ``<conceptType>/<uuid>.md`` + ``mif-manifest.json``. Raises if the
+        MIF portability module is unavailable or a concept is non-conformant.
+        """
+        if self.emit_mif is None:
+            raise RuntimeError("write_mif_bundle() called without emit_mif set")
+        if not self.collected:
+            raise RuntimeError(
+                "no chunks collected to emit as a MIF bundle "
+                "(no supported documents ingested, or all extractions failed)"
+            )
+        # Each id hashes to the concept's UUID and thus its bundle path; duplicate
+        # ids (a file re-imported on the same importer, or a symlink + its target)
+        # would collapse/overwrite concepts. Fail loudly with the offenders.
+        ids = [m.get("id") for m in self.collected]
+        dups = sorted({i for i in ids if ids.count(i) > 1})
+        if dups:
+            raise RuntimeError(
+                "duplicate MIF source ids staged (re-imported document or "
+                f"symlink+target?): {', '.join(dups[:10])}"
+                + (" …" if len(dups) > 10 else "")
+            )
+        export_bundle = self._require_charon()
+        return export_bundle(self.collected, self.emit_mif, validate=True)
+
+    @staticmethod
+    def _require_charon():
+        """Return mnemos-core's MIF ``export_bundle`` or raise a clear error.
+
+        Factored so MIF availability can be checked UP FRONT (before spending time
+        extracting/chunking documents) as well as at bundle-write time.
+        """
+        try:
+            from mnemos.portability.charon import export_bundle
+        except ImportError as exc:  # pragma: no cover - depends on install extras
+            raise RuntimeError(
+                "MIF emit requires the mnemos-core portability module "
+                "(mnemos.portability.charon); it is not importable in this "
+                f"environment: {exc}"
+            ) from exc
+        return export_bundle
 
     def import_directory(self, path: Path, recursive: bool = False) -> dict:
         """Import all supported files found under *path*.
@@ -445,12 +520,24 @@ Examples:
                         help="Override owner_id on imported memories when supported")
     parser.add_argument("--namespace", default=None,
                         help="Override namespace on imported memories when supported")
+    parser.add_argument("--emit-mif", metavar="DIR", default=None,
+                        help="Write ingested chunks as a MIF 1.0 bundle under DIR "
+                             "(directory of schema-validated concept files + manifest) "
+                             "instead of POSTing them to the MNEMOS API.")
     return parser
 
 
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.emit_mif is not None and not args.emit_mif.strip():
+        parser.error("--emit-mif requires a non-empty directory path")
+
+    if args.emit_mif is not None and not args.dry_run:
+        # Fail fast if the MIF portability module is missing, before spending
+        # time extracting/chunking documents.
+        DoclingImporter._require_charon()
 
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
 
@@ -464,6 +551,7 @@ def main(argv=None):
         dry_run=args.dry_run,
         owner_id=args.owner_id,
         namespace=args.namespace,
+        emit_mif=args.emit_mif,
     )
 
     if args.file:
@@ -481,6 +569,11 @@ def main(argv=None):
             sys.exit(1)
         stats = importer.import_directory(path, recursive=args.recursive)
         print(f"\nFinal stats: {stats}")
+
+    if args.emit_mif is not None and not args.dry_run:
+        manifest = importer.write_mif_bundle()
+        print(f"\nMIF bundle: {args.emit_mif}  concepts={manifest['count']}  "
+              f"mif_version={manifest['mif_version']}  schema={manifest['schema']}")
 
 
 if __name__ == "__main__":
