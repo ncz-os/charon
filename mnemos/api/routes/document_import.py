@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +22,7 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.api.routes.memories import _validate_permission_mode
+from mnemos.core.config import get_settings
 from mnemos.core.ids import new_memory_id
 from mnemos.domain.document_repo import (
     DocumentChunkSoftDeletedConflictError,
@@ -32,6 +34,8 @@ router = APIRouter(prefix="/v1/documents", tags=["document-import"])
 _document_repo = DocumentRepository()
 
 _PROJECT_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+_DEFAULT_DOCUMENT_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 _ARCHIVE_SNAPSHOT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "datapool_backups",
@@ -58,6 +62,43 @@ def _validate_project_tag(project_tag: str) -> str:
             detail="project_tag must be a non-empty token using letters, digits, '.', '_' or '-'",
         )
     return value
+
+
+def _positive_int(raw: Any) -> int | None:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _document_import_max_bytes() -> int:
+    env_limit = _positive_int(os.environ.get("MNEMOS_DOCUMENT_IMPORT_MAX_BYTES"))
+    if env_limit is not None:
+        return env_limit
+    try:
+        configured = _positive_int(get_settings().server.max_body_bytes)
+    except Exception:
+        configured = None
+    return configured or _DEFAULT_DOCUMENT_IMPORT_MAX_BYTES
+
+
+async def _read_upload_file_capped(file: UploadFile) -> bytes:
+    max_bytes = _document_import_max_bytes()
+    content = bytearray()
+    while True:
+        chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            return bytes(content)
+        content.extend(chunk)
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"document import file exceeds {max_bytes} bytes; "
+                    "set MNEMOS_DOCUMENT_IMPORT_MAX_BYTES to raise the limit"
+                ),
+            )
 
 
 def _archive_snapshot_reason(*values: str | None) -> str | None:
@@ -289,8 +330,8 @@ async def import_memories_from_document(
             status_code=501, detail="Docling not installed. Install with: pip install mnemos-os[docling]"
         )
 
-    # Read file
-    content = await file.read()
+    # Read file through the same size policy used by normal request bodies.
+    content = await _read_upload_file_capped(file)
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
