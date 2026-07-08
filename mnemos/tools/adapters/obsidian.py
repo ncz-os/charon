@@ -65,6 +65,16 @@ def _iso(value: Any) -> Optional[str]:
     return s if ("T" in s or re.match(r"^\d{4}-\d{2}-\d{2}", s)) else None
 
 
+def _require_http(url: str) -> str:
+    """Reject non-http(s) endpoints. The MNEMOS endpoint is operator-supplied
+    (CLI --post/--endpoint); guard against file://, ftp://, etc. so a
+    misconfigured endpoint cannot become an arbitrary-file read via urllib."""
+    import urllib.parse as _u
+    if _u.urlparse(url).scheme not in ("http", "https"):
+        raise SystemExit(f"refusing non-http(s) MNEMOS endpoint: {url!r}")
+    return url
+
+
 def _ns_component(text: Any) -> str:
     c = re.sub(r"[^A-Za-z0-9_-]+", "-", str(text or "").strip()).strip("-")
     return c or "unknown"
@@ -277,10 +287,12 @@ def mif_to_vault(corpus: Dict[str, Any], vault: Path) -> int:
 def post_mif_to_mnemos(corpus: Dict[str, Any], endpoint: str, api_key: str, *, batch_size: int = 200) -> Dict[str, int]:
     records = corpus.get("records", [])
     totals = {"imported": 0, "skipped": 0, "failed": 0}
-    base = endpoint.rstrip("/") + "/v1/import?format=mif"
+    base = _require_http(endpoint.rstrip("/") + "/v1/import?format=mif")
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     for start in range(0, len(records), batch_size):
         chunk = {**{k: corpus[k] for k in ("@context", "@type", "mif_version")}, "records": records[start:start + batch_size]}
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected -- endpoint is
+        # operator-supplied and scheme-restricted to http(s) via _require_http above.
         req = urllib.request.Request(base, data=json.dumps(chunk).encode(), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
@@ -294,10 +306,11 @@ def post_mif_to_mnemos(corpus: Dict[str, Any], endpoint: str, api_key: str, *, b
 
 
 def fetch_mnemos_as_mif(endpoint: str, api_key: str, *, namespace: Optional[str] = None) -> Dict[str, Any]:
-    url = endpoint.rstrip("/") + "/v1/export?format=mif"
+    url = _require_http(endpoint.rstrip("/") + "/v1/export?format=mif")
     if namespace:
         url += "&namespace=" + urllib.parse.quote(namespace)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected -- url scheme-restricted above.
     with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read())
 
