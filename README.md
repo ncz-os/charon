@@ -61,3 +61,19 @@ migration is applied by core's migration runner.
 > A MIF-native REST portability surface (`/v1/export`, `/v1/import` emitting and
 > accepting MIF bundles directly) is a follow-up; today those routes speak MPF
 > and the MIF path is exercised through the CLI primitives.
+
+
+## Build infrastructure & partners
+
+Continuous integration and package distribution for this project are generously
+supported by our open-source infrastructure partners:
+
+- **[GitLab](https://gitlab.com/)** — canonical source hosting and CI pipelines
+  (format / lint / test gates), via the
+  [GitLab for Open Source](https://about.gitlab.com/solutions/open-source/) program.
+- **[Buildkite](https://buildkite.com/)** — CI/CD orchestration with hosted macOS
+  and Linux agents, and our APT package registry host
+  (`packages.buildkite.com/ncz-os/ncz`), via the
+  [Buildkite Open Source](https://buildkite.com/pricing) program.
+
+Thank you to both for backing open-source software.
