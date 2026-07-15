@@ -53,6 +53,25 @@ def test_typing_and_relationships(tmp_path):
     assert any(r["target"].startswith("urn:mif:") for r in rels)
 
 
+def test_wikilink_target_resolves_to_linked_note_id(tmp_path):
+    corpus = obs.vault_to_mif(_make_vault(tmp_path))
+    by_title = {r["payload"]["title"]: r["payload"] for r in corpus["records"]}
+    mif_note, journal_note = by_title["MIF"], by_title["2026-01-15"]
+
+    # The Journal note's [[MIF]] link must resolve to the actual MIF note's
+    # @id, not a hash of the link text "MIF" (which differs from the note's
+    # own path-derived @id whenever the note lives in a subfolder).
+    journal_rels = journal_note.get("relationships") or []
+    mif_link = next(r for r in journal_rels if r["metadata"]["obsidian"]["wikilink"] == "MIF")
+    assert mif_link["target"] == mif_note["@id"]
+
+    # A dangling link (no note titled "Container Profile" exists) still
+    # falls back to a stable placeholder rather than resolving to anything.
+    mif_rels = mif_note.get("relationships") or []
+    dangling = next(r for r in mif_rels if r["metadata"]["obsidian"]["wikilink"] == "Container Profile")
+    assert dangling["target"] not in (journal_note["@id"], mif_note["@id"])
+
+
 def test_roundtrip_preserves_content_and_layout(tmp_path):
     corpus = obs.vault_to_mif(_make_vault(tmp_path))
     out = tmp_path / "rebuilt"

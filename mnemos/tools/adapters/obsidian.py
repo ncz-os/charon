@@ -129,22 +129,21 @@ def _is_episodic(rel: Path) -> bool:
 
 # ─── IMPORT: Obsidian vault -> MIF ───────────────────────────────────────────
 
-def _note_to_memory(vault: Path, note: Path) -> Dict[str, Any]:
-    rel = note.relative_to(vault)
-    fm, body = _parse_frontmatter(note.read_text(encoding="utf-8", errors="replace"))
+def _resolve_note_id(rel: Path, fm: Dict[str, Any]) -> Optional[str]:
+    oid = fm.get("id") or fm.get("uid")
+    try:
+        return "urn:mif:" + str(uuid.UUID(str(oid))) if oid else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _note_to_memory(note: Path, *, rel: Path, fm: Dict[str, Any], body: str,
+                     mif_id: str, id_by_key: Dict[str, str]) -> Dict[str, Any]:
     episodic = _is_episodic(rel)
     concept = "episodic" if episodic else "semantic"
     comps = [_ns_component(c) for c in rel.parent.parts]
     base = "_episodic/journal" if episodic else "_semantic"
     namespace = "/".join([base, *comps]) if comps else base
-
-    oid = fm.get("id") or fm.get("uid")
-    try:
-        mif_id = "urn:mif:" + str(uuid.UUID(str(oid))) if oid else None
-    except (ValueError, TypeError):
-        mif_id = None
-    if not mif_id:
-        mif_id = "urn:mif:" + str(uuid.uuid5(OBSIDIAN_NS, rel.as_posix()))
 
     rels: List[Dict[str, Any]] = []
     seen = set()
@@ -152,8 +151,14 @@ def _note_to_memory(vault: Path, note: Path) -> Dict[str, Any]:
         tn = tn.strip()
         if tn and tn not in seen:
             seen.add(tn)
+            # Resolve the link to the actual target note's @id (matched by
+            # stem or frontmatter title, built in vault_to_mif) so the
+            # relationship is traversable; fall back to a stable hash of the
+            # link text only for links that don't resolve to any note in
+            # this vault (e.g. genuinely dangling links).
+            target = id_by_key.get(tn) or ("urn:mif:" + str(uuid.uuid5(OBSIDIAN_NS, tn)))
             rels.append({"type": "links-to",
-                         "target": "urn:mif:" + str(uuid.uuid5(OBSIDIAN_NS, tn)),
+                         "target": target,
                          "metadata": {"obsidian": {"wikilink": tn}}})
 
     tags = sorted(set(_as_list(fm.get("tags")) + _INLINE_TAG_RE.findall(body) + ["obsidian"]))
@@ -194,7 +199,27 @@ def iter_notes(vault: Path) -> Iterator[Path]:
 
 def vault_to_mif(vault: Path, *, source_instance: Optional[str] = None) -> Dict[str, Any]:
     """Read an Obsidian vault into a MIF Container Profile corpus."""
-    records = [_note_to_memory(vault, n) for n in iter_notes(vault)]
+    # Pass 1: parse frontmatter and settle each note's own @id first, and
+    # index it by stem and frontmatter title (Obsidian's own [[link]]
+    # resolution keys) so pass 2 can resolve wikilink relationship targets
+    # to the actual linked note's @id instead of a placeholder hashed from
+    # the link text alone (first note wins on stem/title collisions).
+    parsed: List[Tuple[Path, Path, Dict[str, Any], str, str]] = []
+    id_by_key: Dict[str, str] = {}
+    for note in iter_notes(vault):
+        rel = note.relative_to(vault)
+        fm, body = _parse_frontmatter(note.read_text(encoding="utf-8", errors="replace"))
+        mif_id = _resolve_note_id(rel, fm) or ("urn:mif:" + str(uuid.uuid5(OBSIDIAN_NS, rel.as_posix())))
+        parsed.append((note, rel, fm, body, mif_id))
+        for key in (rel.stem, str(fm.get("title") or "").strip()):
+            if key:
+                id_by_key.setdefault(key, mif_id)
+
+    # Pass 2: build the memory records with relationship targets resolved.
+    records = [
+        _note_to_memory(note, rel=rel, fm=fm, body=body, mif_id=mif_id, id_by_key=id_by_key)
+        for note, rel, fm, body, mif_id in parsed
+    ]
     corpus: Dict[str, Any] = {
         "@context": MIF_CONTEXT, "@type": "MemoryCorpus", "mif_version": MIF_VERSION,
         "records": records,
