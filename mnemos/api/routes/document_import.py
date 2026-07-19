@@ -6,12 +6,14 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 try:
+    from docling.datamodel.base_models import DocumentStream
     from docling.document_converter import DocumentConverter
 
     DOCLING_AVAILABLE = True
@@ -124,11 +126,12 @@ class DoclingImporter:
             (full_text, metadata, chunks) where chunks are memory-sized segments
         """
         try:
-            # Parse document with Docling
-            doc = self.converter.convert_bytes(
-                file_content,
-                file_name=filename,
-                format_hint=self._guess_format(filename),
+            # Parse document with Docling. DocumentConverter has no
+            # convert_bytes() method (never did - not in docling's public
+            # API); convert() takes a DocumentStream wrapping the bytes, and
+            # infers the format from the stream's name.
+            doc = self.converter.convert(
+                DocumentStream(name=filename, stream=BytesIO(file_content))
             )
 
             # Extract full text
