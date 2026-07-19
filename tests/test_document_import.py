@@ -236,7 +236,7 @@ More details.
 
         with patch('mnemos.api.routes.document_import.DocumentConverter') as mock_converter_class:
             mock_converter = MagicMock()
-            mock_converter.convert_bytes.return_value = mock_doc
+            mock_converter.convert.return_value = mock_doc
             mock_converter_class.return_value = mock_converter
 
             importer = DoclingImporter()
