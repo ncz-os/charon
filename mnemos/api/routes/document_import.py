@@ -551,7 +551,7 @@ async def import_memories_from_document(
                     )
                     canonical_id = imported.memory_id
                     in_flight_id = canonical_id
-                    if imported.emit_created_event and backend.supports_webhooks:
+                    if imported.emit_created_event and getattr(backend, "supports_webhooks", True):
                         chunk_delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "memory.created",

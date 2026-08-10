@@ -62,3 +62,36 @@ def test_mif_importer_namespace_override(tmp_path, monkeypatch):
     monkeypatch.setattr(MifImporter, "_post", lambda self, mems: (captured.setdefault("m", mems), (len(mems), 0))[1])
     MifImporter(source=str(bundle), namespace="team-b").run()
     assert all(m["namespace"] == "team-b" for m in captured["m"])
+
+
+def test_mif_importer_preserve_metadata_retains_identity_and_timestamps(tmp_path, monkeypatch):
+    bundle = _make_bundle(tmp_path)
+    captured = {}
+    monkeypatch.setattr(
+        MifImporter,
+        "_post",
+        lambda self, mems: (captured.setdefault("memories", mems), (len(mems), 0))[1],
+    )
+
+    MifImporter(source=str(bundle), preserve_metadata=True).run()
+
+    posted = {m["id"]: m for m in captured["memories"]}
+    assert posted["mem_a"]["created"] == "2026-06-28T20:00:00+00:00"
+    assert posted["mem_b"]["created"] == "2026-06-28T20:01:00+00:00"
+
+
+def test_mif_cli_passes_preserve_metadata(monkeypatch):
+    captured = {}
+
+    class _Importer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return {"imported": 0, "failed": 0}
+
+    monkeypatch.setattr("mnemos.tools.memory_import.MifImporter", _Importer)
+    from mnemos.tools.memory_import import main
+
+    main(["mif", "--source", "/unused", "--preserve-metadata"])
+    assert captured["preserve_metadata"] is True

@@ -1119,6 +1119,17 @@ class MifImporter(BaseImporter):
                 payload["owner_id"] = self.owner_id
             if meta:
                 payload["metadata"] = meta
+            if self.preserve_metadata:
+                for key in (
+                    "id", "created", "updated", "owner_id", "permission_mode",
+                    "quality_rating", "verbatim_content", "source_model",
+                    "source_provider", "source_session", "source_agent",
+                    "provenance",
+                ):
+                    if mem.get(key) is not None:
+                        if key == "owner_id" and self.owner_id is not None:
+                            continue
+                        payload[key] = mem[key]
             payloads.append(payload)
         ok, fail = self._post(payloads)
         print(f"Imported {ok} concept(s) from MIF bundle {self.source} ({fail} failed)")
@@ -1354,11 +1365,8 @@ def main(argv=None):
     elif args.subcommand == "mif":
         importer = MifImporter(
             source=args.source,
-            endpoint=args.endpoint,
-            api_key=args.api_key,
             dry_run=getattr(args, "dry_run", False),
-            owner_id=getattr(args, "owner_id", None),
-            namespace=getattr(args, "namespace", None),
+            **common,
         )
         importer.run()
 

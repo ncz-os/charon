@@ -707,6 +707,43 @@ def test_import_non_root_preserve_owner_rejected(monkeypatch):
     assert exc.value.status_code == 403
 
 
+def test_import_accepts_v02_envelope_without_unsupported_sidecars(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    env = _envelope([_memory_record()])
+    env.mpf_version = "0.2.0"
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=env,
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.imported == 1
+
+
+def test_import_rejects_unimplemented_v02_deletion_log(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    env = _envelope([])
+    env.mpf_version = "0.2.0"
+    env.deletion_log = [{"id": "delete-1", "record_id": "mem-1", "deleted_at": "2026-08-10"}]
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException, match="deletion_log") as exc:
+        asyncio.run(
+            portability.import_memories(
+                envelope=env,
+                preserve_owner=False,
+                user=_alice(),
+            )
+        )
+    assert exc.value.status_code == 415
+
+
 def test_import_counts_unsupported_kinds(monkeypatch):
     conn = _Conn()
     _install(monkeypatch, conn)

@@ -74,12 +74,10 @@ Tenancy:
     namespace; default namespace, matching mempalace.py).
 
 Design notes:
-  * Edge records[] ("fact" kind) duplicate what kg_triples[]
-    already carries. This is intentional: MNEMOS /v1/import treats
-    them as first-class memories with content="<subject> <predicate>
-    <object>" so facts land in search index even if a consumer
-    never reads kg_triples[]. The same edge uuid is used for both
-    (the record's id) so a re-importer can dedupe trivially.
+  * Edge records[] ("fact" kind) duplicate what kg_triples[] already
+    carries. This is intentional: the direct MNEMOS migration path
+    normalizes them to searchable memories, while MPF file output retains
+    the portable fact kind. The same edge uuid is used for both.
   * Embeddings (name_embedding, fact_embedding) are NOT emitted —
     MPF importers regenerate with whatever embedder MNEMOS is
     configured for. Graphiti defaults to OpenAI ada; MNEMOS
@@ -101,6 +99,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from mnemos.core.config import get_settings
+from mnemos.tools.adapters._mnemos_import import normalize_record_for_mnemos
 
 MPF_VERSION = "0.1.0"
 # After translation, payloads are MNEMOS-native; declare mnemos-3.1
@@ -823,7 +822,10 @@ def _post_to_mnemos(
             "source_system": envelope.get("source_system"),
             "source_version": envelope.get("source_version"),
             "exported_at": envelope["exported_at"],
-            "records": records[start:start + batch_size],
+            "records": [
+                normalize_record_for_mnemos(record)
+                for record in records[start:start + batch_size]
+            ],
         }
         if is_last and triples:
             chunk["kg_triples"] = triples

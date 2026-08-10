@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mpf_validate.py — validate an MPF envelope against docs/mpf_v0.1.json.
+mpf_validate.py — validate an MPF envelope against the packaged MPF v0.1 schema.
 
 Standalone. Any memory system (Mem0, Letta, Graphiti, Cognee, MNEMOS,
 MemPalace) can use this to validate its own MPF emissions before
@@ -10,7 +10,7 @@ wire-format definition.
 Usage:
   python -m mnemos.tools.mpf_validate --file export.json
   python -m mnemos.tools.mpf_validate --file - < export.json        # stdin
-  python -m mnemos.tools.mpf_validate --file export.json --schema docs/mpf_v0.1.json
+  python -m mnemos.tools.mpf_validate --file export.json --schema schema.json
 
 Exit codes:
   0 — envelope validates
@@ -30,11 +30,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# `parents[2]` is the repo root: this file is mnemos/tools/mpf_validate.py.
-# (The pre-v4 layout had this script at tools/, which is why an older
-# `parent.parent` resolved correctly.)
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SCHEMA = REPO_ROOT / "docs" / "mpf_v0.1.json"
+# Resolve inside the installed package, not against a repository-only docs path.
+DEFAULT_SCHEMA = (
+    Path(__file__).resolve().parents[1]
+    / "domain" / "portability" / "vendor" / "mpf-v0.1.json"
+)
 
 
 def _load_json(path: str) -> Any:
@@ -144,7 +144,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mpf_validate",
         description=(
-            "Validate an MPF envelope against docs/mpf_v0.1.json. Part "
+            "Validate an MPF envelope against the packaged MPF v0.1 schema. Part "
             "of CHARON, MNEMOS's memory portability subsystem. Schema "
             "file is authoritative; this tool is a convenience runner."
         ),

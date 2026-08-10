@@ -33,8 +33,8 @@ Key mapping (Cognee → MPF):
     Entity node            → records[] kind="memory" subcategory="cognee_entity"
     EntityType node        → records[] kind="memory" subcategory="cognee_entity_type"
     Summary / Event nodes  → records[] kind="memory" subcategory="cognee_<type>"
-    chunk-is_part_of-doc   → envelope.relations[] from=chunk to=doc rel="is_part_of"
-    chunk-contains-entity  → envelope.relations[] from=chunk to=entity rel="contains"
+    chunk-is_part_of-doc   → envelope.kg_triples[] predicate="is_part_of"
+    chunk-contains-entity  → envelope.kg_triples[] predicate="contains"
     entity-is_a-type       → envelope.kg_triples[] subj=entity pred="is_a" obj=type
     other LLM-extracted    → envelope.kg_triples[] (subj, pred=rel_name, obj)
     Dataset                → payload.namespace (configurable tenancy axis)
@@ -46,12 +46,10 @@ Design notes:
     a fixed vocabulary — we pass them through verbatim as the triple
     predicate, and preserve any edge ``properties`` under
     ``metadata.cognee.edge_properties``.
-  * Provenance chain (entity → chunk → document) is kept via two
-    parallel mechanisms: ``envelope.relations[]`` captures the
-    structural chunk→doc and chunk→entity edges (1:N), while
-    ``source_record_ids`` on each chunk record points back at its
-    parent document so single-record importers still resolve
-    provenance without parsing the relation table.
+  * Provenance chain (entity → chunk → document) is kept in
+    ``envelope.kg_triples[]`` for structural and semantic edges, while
+    ``source_record_ids`` on each chunk record points back at its parent
+    document so single-record importers can still resolve provenance.
   * Vector embeddings are NOT emitted — MPF spec permits regeneration
     at import time and Cognee's embeddings are model-coupled.
   * Idempotent: same Cognee snapshot emits byte-identical envelope
@@ -61,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -71,6 +70,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from mnemos.tools.adapters._mnemos_import import normalize_record_for_mnemos
+
 MPF_VERSION = "0.1.0"
 # Adapter translates Cognee nodes → MNEMOS memory shape. Cognee-native
 # fields survive round-trip under payload.metadata.cognee.*. The
@@ -78,6 +79,30 @@ MPF_VERSION = "0.1.0"
 # source_system="cognee" marks provenance at envelope level.
 PAYLOAD_VERSION_MNEMOS = "mnemos-3.1"
 SOURCE_SYSTEM = "cognee"
+
+
+def _edge_to_kg_triple(
+    source_id: str,
+    target_id: str,
+    predicate: str,
+    properties: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Map a Cognee edge to the kg_triples shape consumed by MNEMOS."""
+    identity = json.dumps(
+        [source_id, predicate, target_id, properties],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    triple: Dict[str, Any] = {
+        "id": f"cognee-edge-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}",
+        "subject_id": source_id,
+        "predicate": predicate or "related_to",
+        "object_id": target_id,
+    }
+    if properties:
+        triple["metadata"] = {"cognee": {"edge_properties": properties}}
+    return triple
 
 # Cognee is required — we drive its Python API directly. Bail early
 # with a clear message if it isn't importable.
@@ -476,35 +501,23 @@ async def _collect(
         # Canonical structural chunk → document.
         if rel == "is_part_of" and src_type == "DocumentChunk":
             chunk_to_doc[src] = tgt
-            relations.append({
-                "from": src, "rel": "is_part_of", "to": tgt,
-                "metadata": {"cognee": {"edge_properties": props}} if props else {},
-            })
+            kg_triples.append(_edge_to_kg_triple(src, tgt, "is_part_of", props))
             continue
 
         # Canonical structural chunk → entity.
         if rel == "contains" and src_type == "DocumentChunk":
             entity_to_chunks.setdefault(tgt, []).append(src)
-            relations.append({
-                "from": src, "rel": "contains", "to": tgt,
-                "metadata": {"cognee": {"edge_properties": props}} if props else {},
-            })
+            kg_triples.append(_edge_to_kg_triple(src, tgt, "contains", props))
             continue
 
         # Everything else (is_a, mentions, made_from, plus LLM-inferred
         # edges) lands in kg_triples with the relationship name as the
         # predicate, verbatim. source_record_ids wire back the chunk
         # that originated the statement when the edge carried one.
-        triple: Dict[str, Any] = {
-            "subject": src,
-            "predicate": rel or "related_to",
-            "object": tgt,
-        }
+        triple = _edge_to_kg_triple(src, tgt, rel or "related_to", props)
         source_chunk = props.get("source_chunk_id") or props.get("chunk_id")
         if source_chunk:
             triple["source_record_ids"] = [str(source_chunk)]
-        if props:
-            triple["metadata"] = {"cognee": {"edge_properties": props}}
         kg_triples.append(triple)
 
     # 4) Node pass — turn DocumentChunks / Entities / EntityTypes / etc.
@@ -643,7 +656,10 @@ def _post_to_mnemos(
             "source_system": envelope.get("source_system"),
             "source_version": envelope.get("source_version"),
             "exported_at": envelope["exported_at"],
-            "records": records[start:start + batch_size],
+            "records": [
+                normalize_record_for_mnemos(record)
+                for record in records[start:start + batch_size]
+            ],
         }
         if idx == total_batches - 1:
             if envelope.get("relations"):

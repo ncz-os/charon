@@ -68,6 +68,8 @@ class DoclingImporter:
         # directly, alongside the existing MNEMOS-API ingest path.
         self.emit_mif = emit_mif
         self.collected: list[dict] = []
+        self.post_successes = 0
+        self.post_failures = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -426,7 +428,7 @@ class DoclingImporter:
         Returns:
             True on HTTP 2xx, False otherwise.
         """
-        url = f"{self.endpoint}/memories"
+        url = f"{self.endpoint}/v1/memories"
         data = json.dumps(memory).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -470,6 +472,8 @@ class DoclingImporter:
             # Yield in batches (no-op here but preserves batch_size contract)
             _ = batch_size  # used for API contract
 
+        self.post_successes += ok
+        self.post_failures += fail
         return ok, fail
 
 
@@ -575,6 +579,8 @@ def main(argv=None):
         print(f"\nMIF bundle: {args.emit_mif}  concepts={manifest['count']}  "
               f"mif_version={manifest['mif_version']}  schema={manifest['schema']}")
 
+    return 1 if importer.post_failures else 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

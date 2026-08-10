@@ -111,6 +111,29 @@ async def test_all_chunks_committed_returns_200(
 
 @patch("mnemos.api.routes.document_import.DOCLING_AVAILABLE", True)
 @patch("mnemos.api.routes.document_import.DoclingImporter")
+async def test_backend_without_webhook_capability_flag_defaults_to_enabled(
+    mock_importer_class,
+    client,
+    auth_headers,
+    monkeypatch,
+):
+    backend = install_fake_backend(monkeypatch)
+    monkeypatch.delattr(type(backend), "supports_webhooks", raising=False)
+    _stub_importer_with_chunks(mock_importer_class, n=1)
+
+    resp = await client.post(
+        "/v1/documents/import",
+        files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
+        data={"category": "documents", "project_tag": "mnemos"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(backend.webhooks.calls) == 1
+
+
+@patch("mnemos.api.routes.document_import.DOCLING_AVAILABLE", True)
+@patch("mnemos.api.routes.document_import.DoclingImporter")
 async def test_partial_failure_returns_207_multi_status(
     mock_importer_class,
     client,

@@ -56,6 +56,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from mnemos.tools.adapters._mnemos_import import normalize_record_for_mnemos
+
 MPF_VERSION = "0.1.0"
 # /v1/import only admits mnemos-3.1; Letta provenance is preserved via
 # envelope-level source_system="letta" + per-record metadata.letta blob.
@@ -489,7 +491,10 @@ def _post_to_mnemos(
             "source_system": envelope.get("source_system"),
             "source_version": envelope.get("source_version"),
             "exported_at": envelope["exported_at"],
-            "records": records[start:start + batch_size],
+            "records": [
+                normalize_record_for_mnemos(record)
+                for record in records[start:start + batch_size]
+            ],
         }
         data = json.dumps(chunk).encode("utf-8")
         req = urllib.request.Request(base, data=data, headers=headers, method="POST")

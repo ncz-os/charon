@@ -24,6 +24,7 @@ from .phases import (
 from .schemas import (
     MEMORY_PAYLOAD_VERSION,
     MPF_VERSION_PREFIX,
+    MPF_VERSION_PREFIX_V0_2,
     ImportStats,
     MPFEnvelope,
 )
@@ -46,10 +47,20 @@ def _new_stats() -> ImportStats:
 
 
 def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) -> None:
-    if not envelope.mpf_version.startswith(MPF_VERSION_PREFIX):
+    supported_prefixes = (MPF_VERSION_PREFIX, MPF_VERSION_PREFIX_V0_2)
+    if not envelope.mpf_version.startswith(supported_prefixes):
         raise HTTPException(
             status_code=415,
-            detail=(f"Unsupported MPF version {envelope.mpf_version!r}; " f"expected {MPF_VERSION_PREFIX}x"),
+            detail=(
+                f"Unsupported MPF version {envelope.mpf_version!r}; "
+                f"expected {MPF_VERSION_PREFIX}x or {MPF_VERSION_PREFIX_V0_2}x"
+            ),
+        )
+
+    if envelope.deletion_log:
+        raise HTTPException(
+            status_code=415,
+            detail="MPF deletion_log sidecar import is not supported",
         )
 
     if preserve_owner and not is_root(user):
