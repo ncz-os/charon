@@ -148,7 +148,7 @@ async def test_patch_vault_refetch_does_not_rollback(sqlite_backend):
 
 
 @pytest.mark.asyncio
-async def test_route_search_default_does_not_find_vaulted_secret(sqlite_backend):
+async def test_route_search_default_discovers_vaulted_secret_redacted(sqlite_backend):
     from mnemos.api.routes.memories import bulk_create_memories, search_memories
 
     resp = await bulk_create_memories(
@@ -159,7 +159,10 @@ async def test_route_search_default_does_not_find_vaulted_secret(sqlite_backend)
         MemorySearchRequest(query="***REMOVED-CREDENTIAL***", semantic=False, limit=20),
         user=_Root(),
     )
-    assert resp.memory_ids[0] not in [m.id for m in search.memories]
+    discovered = next(m for m in search.memories if m.id == resp.memory_ids[0])
+    assert discovered.vaulted is True
+    assert "***REMOVED-CREDENTIAL***" not in discovered.content
+    assert "[REDACTED]" in discovered.content
 
 
 def test_credential_record_detector_shape():

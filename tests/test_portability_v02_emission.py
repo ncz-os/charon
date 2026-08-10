@@ -1353,8 +1353,8 @@ def test_deletion_log_export_index_migration_is_wired():
     from mnemos.installer import db as installer_db
 
     # The migration file must exist.
-    repo_root = Path(installer_db.__file__).resolve().parents[2]
-    mig_path = repo_root / "db" / "migrations_v5_3_3_deletion_log_export_index.sql"
+    package_root = Path(installer_db.__file__).resolve().parents[1]
+    mig_path = package_root / "db_migrations" / "migrations_v5_3_3_deletion_log_export_index.sql"
     assert mig_path.exists(), (
         "v5.3.3 deletion_log_export_index migration file missing — "
         "required for the deletion_log time-window pagination to scale"
