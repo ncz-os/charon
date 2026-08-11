@@ -5,6 +5,37 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
+def new_import_totals() -> Dict[str, Any]:
+    """Create aggregate counters for one or more /v1/import responses."""
+    return {
+        "imported": 0,
+        "skipped": 0,
+        "failed": 0,
+        "sidecars_imported": {},
+        "sidecars_failed": {},
+        "unsupported_kinds": {},
+    }
+
+
+def accumulate_import_response(totals: Dict[str, Any], body: Dict[str, Any]) -> None:
+    """Accumulate record and mapping-valued sidecar result counters."""
+    for key in ("imported", "skipped", "failed"):
+        totals[key] += int(body.get(key, 0))
+    for key in ("sidecars_imported", "sidecars_failed", "unsupported_kinds"):
+        target = totals[key]
+        for kind, count in (body.get(key) or {}).items():
+            target[kind] = target.get(kind, 0) + int(count)
+
+
+def import_totals_failed(totals: Dict[str, Any]) -> bool:
+    """Return whether the server reported any incomplete import work."""
+    return bool(
+        totals.get("failed", 0)
+        or sum((totals.get("sidecars_failed") or {}).values())
+        or sum((totals.get("unsupported_kinds") or {}).values())
+    )
+
+
 def normalize_record_for_mnemos(record: Dict[str, Any]) -> Dict[str, Any]:
     """Convert a non-memory MPF record to a searchable MNEMOS memory.
 

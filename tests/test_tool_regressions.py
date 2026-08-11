@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import builtins
 import json
 from pathlib import Path
 import sys
@@ -11,7 +12,11 @@ import pytest
 from mnemos.tools import docling_import, mpf_validate
 from mnemos.tools.memory_import import MifImporter
 from mnemos.tools.adapters import cognee, letta, mem0
-from mnemos.tools.adapters._mnemos_import import normalize_record_for_mnemos
+from mnemos.tools.adapters._mnemos_import import (
+    import_totals_failed,
+    new_import_totals,
+    normalize_record_for_mnemos,
+)
 
 try:
     from mnemos.tools.adapters import graphiti
@@ -33,6 +38,9 @@ except ModuleNotFoundError as exc:
 class _Response:
     status = 200
 
+    def __init__(self, body=None):
+        self.body = body or {"imported": 1, "skipped": 0, "failed": 0}
+
     def __enter__(self):
         return self
 
@@ -40,7 +48,7 @@ class _Response:
         return False
 
     def read(self):
-        return json.dumps({"imported": 1, "skipped": 0, "failed": 0}).encode()
+        return json.dumps(self.body).encode()
 
 
 def test_docling_posts_to_versioned_memories_route(monkeypatch):
@@ -99,6 +107,73 @@ def test_direct_adapter_post_normalizes_non_memory_records(adapter, monkeypatch)
     assert posted["payload"]["metadata"]["mpf"]["original_kind"] == "fact"
 
 
+@pytest.mark.parametrize("adapter", [letta, mem0, cognee, graphiti])
+def test_direct_adapter_post_accumulates_record_sidecar_and_kind_failures(adapter, monkeypatch):
+    response = {
+        "imported": 1,
+        "skipped": 0,
+        "failed": 2,
+        "sidecars_imported": {"kg_triples": 3},
+        "sidecars_failed": {"kg_triples": 4},
+        "unsupported_kinds": {"fact": 5},
+    }
+    monkeypatch.setattr(
+        adapter.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(response),
+    )
+    envelope = {
+        "mpf_version": "0.1.1",
+        "source_system": "foreign",
+        "source_version": "1",
+        "exported_at": "2026-08-10T00:00:00+00:00",
+        "records": [{
+            "id": "foreign-1",
+            "kind": "memory",
+            "payload_version": "mnemos-3.1",
+            "payload": {"content": "memory"},
+        }],
+    }
+
+    totals = adapter._post_to_mnemos(envelope, "http://mnemos.example", "token")
+
+    assert totals["failed"] == 2
+    assert totals["sidecars_imported"] == {"kg_triples": 3}
+    assert totals["sidecars_failed"] == {"kg_triples": 4}
+    assert totals["unsupported_kinds"] == {"fact": 5}
+    assert import_totals_failed(totals)
+
+
+@pytest.mark.parametrize("adapter", [letta, mem0, cognee, graphiti])
+def test_adapter_main_returns_nonzero_for_server_reported_failure(adapter, monkeypatch):
+    envelope = {
+        "mpf_version": "0.1.1",
+        "source_system": "foreign",
+        "source_version": "1",
+        "exported_at": "2026-08-10T00:00:00+00:00",
+        "records": [],
+        "record_count": 0,
+        "kg_triple_count": 0,
+        "diagnostics": {},
+    }
+    totals = new_import_totals()
+    totals["sidecars_failed"] = {"kg_triples": 1}
+    monkeypatch.setattr(adapter, "_post_to_mnemos", lambda *args, **kwargs: totals)
+    monkeypatch.setattr(adapter, "build_envelope", lambda *args, **kwargs: envelope)
+
+    if adapter is cognee:
+        monkeypatch.setattr(adapter, "_require_cognee", lambda: None)
+    elif adapter is letta:
+        monkeypatch.setattr(adapter, "_resolve_mode", lambda *args: "server")
+    elif adapter is graphiti:
+        source = type("Source", (), {"close": lambda self: None})()
+        monkeypatch.setattr(adapter, "_open_backend", lambda args: source)
+
+    assert adapter.main([
+        "--post", "http://mnemos.example", "--api-key", "token"
+    ]) == 1
+
+
 def test_non_memory_normalization_does_not_mutate_export_record():
     record = {
         "id": "event-1",
@@ -132,6 +207,24 @@ def test_mpf_validator_default_schema_is_packaged_and_validates_v01(tmp_path):
     }))
     assert Path(mpf_validate.DEFAULT_SCHEMA).is_file()
     assert mpf_validate.main(["--file", str(envelope), "--quiet"]) == 0
+
+
+def test_mpf_validator_falls_back_when_jsonschema_is_unavailable(monkeypatch):
+    real_import = builtins.__import__
+
+    def _without_jsonschema(name, *args, **kwargs):
+        if name == "jsonschema.validators":
+            raise ImportError("jsonschema intentionally unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _without_jsonschema)
+    env = {
+        "mpf_version": "0.1.1",
+        "exported_at": "2026-08-10T00:00:00+00:00",
+        "records": [],
+    }
+
+    assert mpf_validate.validate(env, {"type": "object"}) == []
 
 
 def test_mif_preserve_metadata_keeps_recovered_fields(monkeypatch):

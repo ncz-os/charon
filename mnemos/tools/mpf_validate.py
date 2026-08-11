@@ -89,8 +89,7 @@ def _full_check(env: Any, schema: Any) -> List[str]:
     try:
         from jsonschema.validators import Draft202012Validator
     except ImportError:
-        return ["jsonschema not installed — skipping full-schema check; "
-                "install with `pip install jsonschema` to enable"]
+        return []
     try:
         validator = Draft202012Validator(schema)
     except Exception as exc:

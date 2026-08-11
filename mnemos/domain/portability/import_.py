@@ -63,6 +63,28 @@ def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) 
             detail="MPF deletion_log sidecar import is not supported",
         )
 
+    if envelope.mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
+        unsupported_record_fields = {
+            field
+            for record in envelope.records
+            for field in (
+                "provenance",
+                "valid_time_start",
+                "valid_time_end",
+                "transaction_time",
+            )
+            if getattr(record, field) is not None
+        }
+        if unsupported_record_fields:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    "MPF 0.2 record-level provenance and temporal fields are "
+                    "not supported for import without data loss: "
+                    f"{', '.join(sorted(unsupported_record_fields))}"
+                ),
+            )
+
     if preserve_owner and not is_root(user):
         raise HTTPException(status_code=403, detail="preserve_owner=true requires root")
 
@@ -153,9 +175,37 @@ async def import_memories(
 
             category = p.get("category") or "imported"
             subcategory = p.get("subcategory")
-            permission_mode = p.get("permission_mode") or 600
+            permission_mode = p.get("permission_mode")
+            if permission_mode is None:
+                permission_mode = 600
+            if (
+                not isinstance(permission_mode, int)
+                or isinstance(permission_mode, bool)
+                or permission_mode < 0
+                or permission_mode > 777
+                or any(digit not in "01234567" for digit in str(permission_mode))
+            ):
+                stats.failed += 1
+                stats.errors.append(
+                    f"{record.id}: permission_mode must be octal-style 0-777; skipped"
+                )
+                rejected_persisted_ids.add(record.id)
+                continue
             metadata = p.get("metadata") or {}
-            quality_rating = p.get("quality_rating") or 75
+            quality_rating = p.get("quality_rating")
+            if quality_rating is None:
+                quality_rating = 75
+            if (
+                not isinstance(quality_rating, int)
+                or isinstance(quality_rating, bool)
+                or not 0 <= quality_rating <= 100
+            ):
+                stats.failed += 1
+                stats.errors.append(
+                    f"{record.id}: quality_rating must be an integer from 0 to 100; skipped"
+                )
+                rejected_persisted_ids.add(record.id)
+                continue
             verbatim_content = p.get("verbatim_content") or content
 
             classified = classify_persisted_text_fields(
@@ -271,6 +321,7 @@ async def import_memories(
                     inserted_record_ids.add(persisted_id)
                     if backend is not None and tx is not None:
                         await _write_mpf_import_audit_entry(
+                            conn,
                             backend,
                             tx,
                             memory_id=persisted_id,
@@ -458,6 +509,7 @@ async def import_memories(
 
 
 async def _write_mpf_import_audit_entry(
+    conn,
     backend: AuditPersistence,
     tx: Transaction,
     *,
@@ -480,16 +532,29 @@ async def _write_mpf_import_audit_entry(
     if not session_secret:
         logger.warning("[mpf_import] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write")
         return
-    await write_audit_entry(
-        backend,
-        tx,
-        op="create",
-        memory_id_str=memory_id,
-        content=content,
-        category=category,
-        subcategory=subcategory,
-        metadata=metadata,
-        embedding=None,
-        writer_id=writer_id,
-        session_secret=session_secret,
-    )
+    try:
+        # asyncpg implements a nested transaction as a savepoint.  Audit is
+        # optional, but write_audit_entry must re-raise so a failed statement
+        # rolls back to this savepoint instead of leaving the outer import
+        # transaction aborted.
+        async with conn.transaction():
+            await write_audit_entry(
+                backend,
+                tx,
+                op="create",
+                memory_id_str=memory_id,
+                content=content,
+                category=category,
+                subcategory=subcategory,
+                metadata=metadata,
+                embedding=None,
+                writer_id=writer_id,
+                session_secret=session_secret,
+                enforce_continuity=True,
+            )
+    except Exception:
+        logger.warning(
+            "Optional MPF import audit write failed for record %s",
+            memory_id,
+            exc_info=True,
+        )

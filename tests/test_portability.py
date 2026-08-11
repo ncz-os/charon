@@ -724,6 +724,37 @@ def test_import_accepts_v02_envelope_without_unsupported_sidecars(monkeypatch):
     assert stats.imported == 1
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provenance", {"wasAttributedTo": {"type": "user", "id": "alice"}}),
+        ("valid_time_start", "2026-08-10T00:00:00Z"),
+        ("valid_time_end", "2026-08-11T00:00:00Z"),
+        ("transaction_time", "2026-08-10T00:00:00Z"),
+    ],
+)
+def test_import_rejects_v02_record_fields_it_cannot_preserve(monkeypatch, field, value):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    record = _memory_record()
+    setattr(record, field, value)
+    env = _envelope([record])
+    env.mpf_version = "0.2.0"
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException, match=field) as exc:
+        asyncio.run(
+            portability.import_memories(
+                envelope=env,
+                preserve_owner=False,
+                user=_alice(),
+            )
+        )
+    assert exc.value.status_code == 415
+    assert conn.executes == []
+
+
 def test_import_rejects_unimplemented_v02_deletion_log(monkeypatch):
     conn = _Conn()
     _install(monkeypatch, conn)
@@ -798,6 +829,192 @@ def test_import_empty_content_fails(monkeypatch):
     assert stats.imported == 0
     assert stats.failed == 1
     assert any("empty content" in e for e in stats.errors)
+
+
+def test_import_preserves_zero_permission_mode_and_quality_rating(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    record = _memory_record()
+    record.payload["permission_mode"] = 0
+    record.payload["quality_rating"] = 0
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=_envelope([record]),
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.imported == 1
+    insert_args = next(args for sql, args in conn.executes if "INSERT INTO memories" in sql)
+    assert insert_args[5] == 0
+    assert insert_args[9] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("permission_mode", 888, "octal-style"),
+        ("permission_mode", True, "octal-style"),
+        ("quality_rating", 101, "0 to 100"),
+        ("quality_rating", False, "0 to 100"),
+    ],
+)
+def test_import_rejects_invalid_permission_and_quality_values(
+    monkeypatch, field, value, message
+):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    record = _memory_record()
+    record.payload[field] = value
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=_envelope([record]),
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.imported == 0
+    assert stats.failed == 1
+    assert any(message in error for error in stats.errors)
+    assert all("INSERT INTO memories" not in sql for sql, _ in conn.executes)
+
+
+def test_import_optional_audit_failure_isolated_from_memory_insert(monkeypatch):
+    from mnemos.domain.portability import import_ as import_domain
+    import mnemos.audit as audit_module
+    import mnemos.core.config as config_module
+    import mnemos.workers.audit_sealer as audit_sealer_module
+
+    class _TrackingConn(_Conn):
+        def __init__(self):
+            super().__init__()
+            self.transaction_exits = []
+
+        def transaction(self, *args, **kwargs):
+            parent = self
+
+            class _TrackingCtx:
+                async def __aenter__(self_):
+                    return self_
+
+                async def __aexit__(self_, exc_type, exc, tb):
+                    parent.transaction_exits.append(exc_type)
+                    return False
+
+            return _TrackingCtx()
+
+    conn = _TrackingConn()
+
+    async def _failed_write(*args, **kwargs):
+        raise RuntimeError("audit table unavailable")
+
+    settings = type(
+        "Settings", (), {"server": type("Server", (), {"session_secret": "secret"})()}
+    )()
+    monkeypatch.setattr(audit_module, "write_audit_entry", _failed_write)
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(audit_sealer_module, "audit_chain_enabled", lambda: True)
+    backend = type("Backend", (), {"audit_chain": object()})()
+    tx = object()
+
+    stats = asyncio.run(
+        import_domain.import_memories(
+            conn,
+            envelope=_envelope([_memory_record()]),
+            preserve_owner=False,
+            user=_alice(),
+            backend=backend,
+            tx=tx,
+        )
+    )
+
+    assert stats.imported == 1
+    assert stats.failed == 0
+    assert RuntimeError in conn.transaction_exits
+
+
+def test_import_audit_helper_requests_failure_propagation(monkeypatch):
+    from mnemos.domain.portability import import_ as import_domain
+    import mnemos.audit as audit_module
+    import mnemos.core.config as config_module
+    import mnemos.workers.audit_sealer as audit_sealer_module
+
+    captured = {}
+
+    async def _write_audit_entry(*args, **kwargs):
+        captured.update(kwargs)
+
+    settings = type(
+        "Settings", (), {"server": type("Server", (), {"session_secret": "secret"})()}
+    )()
+    monkeypatch.setattr(audit_module, "write_audit_entry", _write_audit_entry)
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(audit_sealer_module, "audit_chain_enabled", lambda: True)
+
+    asyncio.run(
+        import_domain._write_mpf_import_audit_entry(
+            _Conn(),
+            type("Backend", (), {"audit_chain": object()})(),
+            object(),
+            memory_id="mem_1",
+            content="body",
+            category="solutions",
+            subcategory=None,
+            metadata={},
+            writer_id="alice",
+        )
+    )
+
+    assert captured["enforce_continuity"] is True
+
+
+@pytest.mark.parametrize(
+    ("has_chain", "enabled", "secret"),
+    [
+        (False, True, "secret"),
+        (True, False, "secret"),
+        (True, True, ""),
+    ],
+)
+def test_import_audit_disabled_paths_do_not_open_savepoint(
+    monkeypatch, has_chain, enabled, secret
+):
+    from mnemos.domain.portability import import_ as import_domain
+    import mnemos.audit as audit_module
+    import mnemos.core.config as config_module
+    import mnemos.workers.audit_sealer as audit_sealer_module
+
+    class _NoTransactionConn:
+        def transaction(self):
+            raise AssertionError("disabled audit path must not open a savepoint")
+
+    async def _unexpected_write(*args, **kwargs):
+        raise AssertionError("disabled audit path must not write")
+
+    settings = type(
+        "Settings", (), {"server": type("Server", (), {"session_secret": secret})()}
+    )()
+    monkeypatch.setattr(audit_module, "write_audit_entry", _unexpected_write)
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(audit_sealer_module, "audit_chain_enabled", lambda: enabled)
+
+    asyncio.run(
+        import_domain._write_mpf_import_audit_entry(
+            _NoTransactionConn(),
+            type("Backend", (), {"audit_chain": object() if has_chain else None})(),
+            object(),
+            memory_id="mem_1",
+            content="body",
+            category="solutions",
+            subcategory=None,
+            metadata={},
+            writer_id="alice",
+        )
+    )
 
 
 def test_import_wrong_mpf_version_returns_415(monkeypatch):

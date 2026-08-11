@@ -70,7 +70,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from mnemos.tools.adapters._mnemos_import import normalize_record_for_mnemos
+from mnemos.tools.adapters._mnemos_import import (
+    accumulate_import_response,
+    import_totals_failed,
+    new_import_totals,
+    normalize_record_for_mnemos,
+)
 
 MPF_VERSION = "0.1.0"
 # Adapter translates Cognee nodes → MNEMOS memory shape. Cognee-native
@@ -632,7 +637,7 @@ def _post_to_mnemos(
     api_key: str,
     *,
     batch_size: int = 200,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """POST to MNEMOS /v1/import?preserve_owner=true in batches.
 
     Matches the mempalace/mem0/letta/graphiti adapters: each batch
@@ -642,7 +647,7 @@ def _post_to_mnemos(
     already exist server-side when the KG links are applied.
     """
     records = envelope.get("records") or []
-    totals = {"imported": 0, "skipped": 0, "failed": 0}
+    totals = new_import_totals()
     base = endpoint.rstrip("/") + "/v1/import?preserve_owner=true"
     headers = {
         "Content-Type": "application/json",
@@ -671,8 +676,7 @@ def _post_to_mnemos(
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 body = json.loads(resp.read())
-                for k in ("imported", "skipped", "failed"):
-                    totals[k] += int(body.get(k, 0))
+                accumulate_import_response(totals, body)
                 print(
                     f"  batch {idx + 1}/{total_batches}: "
                     f"imported={body.get('imported')} "
@@ -683,7 +687,7 @@ def _post_to_mnemos(
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")[:300]
             print(f"  WARNING /v1/import HTTP {e.code}: {body}", file=sys.stderr)
-            totals["failed"] += len(chunk["records"])
+            totals["failed"] += max(1, len(chunk["records"]))
     return totals
 
 
@@ -763,9 +767,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"POST complete: "
             f"imported={totals['imported']} "
             f"skipped={totals['skipped']} "
-            f"failed={totals['failed']}",
+            f"failed={totals['failed']} "
+            f"sidecars_failed={sum(totals['sidecars_failed'].values())} "
+            f"unsupported={sum(totals['unsupported_kinds'].values())}",
             file=sys.stderr,
         )
+        if import_totals_failed(totals):
+            return 1
     return 0
 
 
