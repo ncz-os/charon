@@ -273,6 +273,57 @@ def test_v0_1_envelope_dump_via_helper_strips_record_v0_2_fields():
         )
 
 
+def test_memory_to_record_preserves_distinct_verbatim_content_and_redacts_it():
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    row = {
+        **_BASE_ROW,
+        "content": "compressed summary",
+        "verbatim_content": f"full original evidence {secret}",
+    }
+
+    raw = _memory_to_record(row, redact_secrets=False)
+    redacted = _memory_to_record(row, redact_secrets=True)
+
+    assert raw.payload["verbatim_content"] == f"full original evidence {secret}"
+    assert redacted.payload["verbatim_content"] != raw.payload["verbatim_content"]
+    assert secret not in redacted.payload["verbatim_content"]
+
+
+def test_memory_to_record_restores_imported_v02_fields_without_leaking_bridge():
+    fields = {
+        "provenance": {
+            "wasAttributedTo": {"type": "user", "id": "alice"},
+            "wasGeneratedBy": {"type": "activity", "id": "job-1"},
+            "generatedAtTime": "2026-05-05T00:00:00Z",
+        },
+        "valid_time_start": "2026-05-01T00:00:00Z",
+        "valid_time_end": "2026-05-04T00:00:00Z",
+        "transaction_time": "2026-05-05T00:00:00Z",
+    }
+    row = {
+        **_BASE_ROW,
+        "metadata": {
+            "customer": "kept",
+            "_mnemos_charon_mpf_v0_2_record_fields": {
+                "record_fields": fields,
+                "original_metadata_value_present": True,
+                "original_metadata_value": "customer-owned-value",
+            },
+        },
+    }
+
+    record = _memory_to_record(row, mpf_version="0.2.0")
+
+    assert record.provenance == fields["provenance"]
+    assert record.valid_time_start == fields["valid_time_start"]
+    assert record.valid_time_end == fields["valid_time_end"]
+    assert record.transaction_time == fields["transaction_time"]
+    assert record.payload["metadata"] == {
+        "customer": "kept",
+        "_mnemos_charon_mpf_v0_2_record_fields": "customer-owned-value",
+    }
+
+
 def test_change_type_compress_is_normalized_to_update():
     """Round-2 codex finding: MNEMOS uses change_type='compress' for
     compression-DAG version rows, but the v0.2 spec only allows

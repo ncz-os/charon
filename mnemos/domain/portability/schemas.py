@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -28,7 +28,7 @@ class MPFRecord(BaseModel):
     id: str
     kind: str
     payload_version: str
-    payload: Dict[str, Any]
+    payload: Union[Dict[str, Any], List[Any], str]
     # v0.2-only record-level fields. Optional so v0.1 envelopes serialize
     # cleanly via exclude_none.
     provenance: Optional[Dict[str, Any]] = None
@@ -53,12 +53,17 @@ class MPFEnvelope(BaseModel):
     source_system: Optional[str] = SOURCE_SYSTEM
     source_version: Optional[str] = SOURCE_VERSION
     source_instance: Optional[str] = None
+    source_commit: Optional[str] = None
     exported_at: Optional[str] = None
     record_count: Optional[int] = None
     records: List[MPFRecord] = Field(default_factory=list)
     kg_triples: Optional[List[Dict[str, Any]]] = None
+    relations: Optional[List[Dict[str, Any]]] = None
     memory_versions: Optional[List[Dict[str, Any]]] = None
     compression_manifest: Optional[List[Dict[str, Any]]] = None
+    compression_candidates: Optional[List[Dict[str, Any]]] = None
+    embeddings: Optional[Dict[str, Any]] = None
+    attestations: Optional[List[Dict[str, Any]]] = None
     # v0.2 deletion_log sidecar — populated by the export pipeline when
     # mpf_version=0.2 + include_sidecars=true (scoped by owner/namespace,
     # capped at _EXPORT_SIDECAR_HARD_LIMIT). v0.1 envelopes do not carry

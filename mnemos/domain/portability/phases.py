@@ -49,6 +49,13 @@ async def _import_kg_triples(
                 )
 
     for entry in sidecar:
+        if entry.get("metadata"):
+            _bump(stats.sidecars_failed, surface)
+            stats.errors.append(
+                f"[{surface}] {entry.get('id', '<missing id>')}: metadata is not "
+                "supported by KG persistence; skipped"
+            )
+            continue
         if not entry.get("id") or not entry.get("predicate"):
             _bump(stats.sidecars_failed, surface)
             stats.errors.append(f"[{surface}] missing required id/predicate; skipped")

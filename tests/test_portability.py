@@ -131,6 +131,7 @@ def _memory_row(
     return {
         "id": id,
         "content": content,
+        "verbatim_content": content,
         "category": category,
         "subcategory": None,
         "created": datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -166,11 +167,44 @@ def test_export_filters_by_caller_owner_and_namespace_for_non_root(monkeypatch):
         )
     )
 
-    sql, args = conn.fetch_calls[-1]
+    sql, args = next(
+        (sql, args) for sql, args in conn.fetch_calls if "owner_id = $" in sql
+    )
     assert "owner_id = $" in sql
     assert "namespace = $" in sql
     assert "alice" in args
     assert "alice-ns" in args
+
+
+def test_export_fetches_and_emits_distinct_verbatim_content(monkeypatch):
+    memory = _memory_row(content="compressed summary")
+    memory.pop("verbatim_content")
+    conn = _Conn(
+        rows=[memory],
+        routed_rows={
+            "SELECT id, verbatim_content FROM memories": [{
+                "id": memory["id"],
+                "verbatim_content": "full original evidence",
+            }],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(
+        portability.export_memories(
+            category=None,
+            limit=1000,
+            offset=0,
+            owner_id=None,
+            namespace=None,
+            include_sidecars=False,
+            include_secrets=True,
+            user=_root(),
+        )
+    )
+
+    assert env.records[0].payload["content"] == "compressed summary"
+    assert env.records[0].payload["verbatim_content"] == "full original evidence"
 
 
 def test_export_non_root_cross_owner_param_rejected(monkeypatch):
@@ -724,22 +758,48 @@ def test_import_accepts_v02_envelope_without_unsupported_sidecars(monkeypatch):
     assert stats.imported == 1
 
 
+def test_request_model_retains_published_envelope_fields_and_opaque_payloads():
+    raw = {
+        "mpf_version": "0.1.1",
+        "source_commit": "abc123",
+        "records": [{
+            "id": "future-1",
+            "kind": "acme.observation",
+            "payload_version": "acme-1",
+            "payload": [1, 2],
+        }],
+        "relations": [{"source_id": "a", "target_id": "b", "type": "derived_from"}],
+        "compression_candidates": [{"record_id": "a"}],
+        "embeddings": {"format": "inline"},
+        "attestations": [{"algorithm": "test"}],
+    }
+
+    env = portability.MPFEnvelope.model_validate(raw)
+
+    assert env.source_commit == "abc123"
+    assert env.records[0].payload == [1, 2]
+    assert env.relations == raw["relations"]
+    assert env.compression_candidates == raw["compression_candidates"]
+    assert env.embeddings == raw["embeddings"]
+    assert env.attestations == raw["attestations"]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("provenance", {"wasAttributedTo": {"type": "user", "id": "alice"}}),
-        ("valid_time_start", "2026-08-10T00:00:00Z"),
-        ("valid_time_end", "2026-08-11T00:00:00Z"),
-        ("transaction_time", "2026-08-10T00:00:00Z"),
+        ("relations", [{"source_id": "a", "target_id": "b"}]),
+        ("compression_candidates", [{"record_id": "a"}]),
+        ("embeddings", {"format": "inline"}),
+        ("attestations", [{"algorithm": "test"}]),
     ],
 )
-def test_import_rejects_v02_record_fields_it_cannot_preserve(monkeypatch, field, value):
+def test_import_rejects_unimplemented_published_envelope_fields_before_writes(
+    monkeypatch, field, value
+):
     conn = _Conn()
     _install(monkeypatch, conn)
-    record = _memory_record()
-    setattr(record, field, value)
-    env = _envelope([record])
-    env.mpf_version = "0.2.0"
+    env = _envelope([_memory_record()])
+    setattr(env, field, value)
 
     from fastapi import HTTPException
 
@@ -753,6 +813,98 @@ def test_import_rejects_v02_record_fields_it_cannot_preserve(monkeypatch, field,
         )
     assert exc.value.status_code == 415
     assert conn.executes == []
+
+
+def test_import_skips_unknown_kind_with_array_payload():
+    env = portability.MPFEnvelope.model_validate({
+        "mpf_version": "0.1.1",
+        "records": [{
+            "id": "future-1",
+            "kind": "acme.observation",
+            "payload_version": "acme-1",
+            "payload": [1, 2],
+        }],
+    })
+    conn = _Conn()
+
+    stats = asyncio.run(
+        portability._import_memories(
+            conn,
+            envelope=env,
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.unsupported_kinds == {"acme.observation": 1}
+    assert stats.failed == 0
+    assert conn.executes == []
+
+
+def test_import_rejects_non_object_memory_payload_without_crashing():
+    env = portability.MPFEnvelope.model_validate({
+        "mpf_version": "0.1.1",
+        "records": [{
+            "id": "memory-1",
+            "kind": "memory",
+            "payload_version": "mnemos-3.1",
+            "payload": "not an object",
+        }],
+    })
+    conn = _Conn()
+
+    stats = asyncio.run(
+        portability._import_memories(
+            conn,
+            envelope=env,
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.failed == 1
+    assert "payload must be an object" in stats.errors[0]
+    assert conn.executes == []
+
+
+def test_import_preserves_v02_record_fields_in_metadata_bridge(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    record = _memory_record()
+    record.provenance = {
+        "wasAttributedTo": {"type": "user", "id": "alice"},
+        "wasGeneratedBy": {"type": "activity", "id": "job-1"},
+        "generatedAtTime": "2026-08-10T00:00:00Z",
+    }
+    record.valid_time_start = "2026-08-09T00:00:00Z"
+    record.valid_time_end = "2026-08-11T00:00:00Z"
+    record.transaction_time = "2026-08-10T00:00:00Z"
+    record.payload["metadata"] = {
+        "_mnemos_charon_mpf_v0_2_record_fields": "customer-owned-value"
+    }
+    env = _envelope([record])
+    env.mpf_version = "0.2.0"
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=env,
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.imported == 1
+    insert_args = next(args for sql, args in conn.executes if "INSERT INTO memories" in sql)
+    metadata = __import__("json").loads(insert_args[4])
+    bridge = metadata["_mnemos_charon_mpf_v0_2_record_fields"]
+    assert bridge["original_metadata_value_present"] is True
+    assert bridge["original_metadata_value"] == "customer-owned-value"
+    assert bridge["record_fields"] == {
+        "provenance": record.provenance,
+        "valid_time_start": record.valid_time_start,
+        "valid_time_end": record.valid_time_end,
+        "transaction_time": record.transaction_time,
+    }
 
 
 def test_import_rejects_unimplemented_v02_deletion_log(monkeypatch):
@@ -1952,6 +2104,28 @@ def test_import_no_sidecars_means_no_sidecar_inserts(monkeypatch):
     assert not any(
         "kg_triples" in e[0] or "memory_versions" in e[0] or "memory_compressed_variants" in e[0] for e in conn.executes
     )
+
+
+def test_import_reports_kg_metadata_as_failed_instead_of_discarding_it(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+    triple = _kg_sidecar_entry(id="cognee-edge-1")
+    triple["memory_id"] = None
+    triple["metadata"] = {"cognee": {"edge_properties": {"rank": 1}}}
+    env = portability.MPFEnvelope(records=[], kg_triples=[triple])
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=env,
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert stats.sidecars_imported == {}
+    assert "metadata is not supported" in stats.errors[0]
+    assert not any("INSERT INTO kg_triples" in sql for sql, _ in conn.executes)
 
 
 # ─── /v1/import — cross-tenant attachment defense (Codex finding #3) ────────

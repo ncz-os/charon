@@ -28,6 +28,7 @@ from .schemas import (
     ImportStats,
     MPFEnvelope,
 )
+from .serializers import _MPF_V0_2_RECORD_FIELDS_METADATA_KEY
 from .timestamps import _parse_iso_naive
 
 logger = logging.getLogger(__name__)
@@ -63,27 +64,25 @@ def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) 
             detail="MPF deletion_log sidecar import is not supported",
         )
 
-    if envelope.mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
-        unsupported_record_fields = {
-            field
-            for record in envelope.records
-            for field in (
-                "provenance",
-                "valid_time_start",
-                "valid_time_end",
-                "transaction_time",
-            )
-            if getattr(record, field) is not None
-        }
-        if unsupported_record_fields:
-            raise HTTPException(
-                status_code=415,
-                detail=(
-                    "MPF 0.2 record-level provenance and temporal fields are "
-                    "not supported for import without data loss: "
-                    f"{', '.join(sorted(unsupported_record_fields))}"
-                ),
-            )
+    unsupported_envelope_fields = [
+        field
+        for field in (
+            "relations",
+            "compression_candidates",
+            "attestations",
+        )
+        if getattr(envelope, field)
+    ]
+    if envelope.embeddings is not None:
+        unsupported_envelope_fields.append("embeddings")
+    if unsupported_envelope_fields:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "MPF envelope fields are not supported for import without "
+                "data loss: " + ", ".join(sorted(unsupported_envelope_fields))
+            ),
+        )
 
     if preserve_owner and not is_root(user):
         raise HTTPException(status_code=403, detail="preserve_owner=true requires root")
@@ -159,6 +158,13 @@ async def import_memories(
                 continue
 
             p = record.payload
+            if not isinstance(p, dict):
+                stats.failed += 1
+                stats.errors.append(
+                    f"{record.id}: kind 'memory' payload must be an object; skipped"
+                )
+                rejected_persisted_ids.add(record.id)
+                continue
             if preserve_owner:
                 imported_owner = p.get("owner_id") or user.user_id
                 imported_ns = p.get("namespace") or user.namespace
@@ -192,6 +198,27 @@ async def import_memories(
                 rejected_persisted_ids.add(record.id)
                 continue
             metadata = p.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                stats.failed += 1
+                stats.errors.append(f"{record.id}: metadata must be an object; skipped")
+                rejected_persisted_ids.add(record.id)
+                continue
+            metadata = dict(metadata)
+            if envelope.mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
+                bridge = {
+                    "record_fields": {
+                        "provenance": record.provenance,
+                        "valid_time_start": record.valid_time_start,
+                        "valid_time_end": record.valid_time_end,
+                        "transaction_time": record.transaction_time,
+                    },
+                }
+                if _MPF_V0_2_RECORD_FIELDS_METADATA_KEY in metadata:
+                    bridge["original_metadata_value_present"] = True
+                    bridge["original_metadata_value"] = metadata[
+                        _MPF_V0_2_RECORD_FIELDS_METADATA_KEY
+                    ]
+                metadata[_MPF_V0_2_RECORD_FIELDS_METADATA_KEY] = bridge
             quality_rating = p.get("quality_rating")
             if quality_rating is None:
                 quality_rating = 75

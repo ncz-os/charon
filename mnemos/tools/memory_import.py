@@ -223,6 +223,7 @@ class BaseImporter:
                 "source_provider": mem.get("source_provider"),
                 "source_session": mem.get("source_session"),
                 "source_agent": mem.get("source_agent"),
+                "verbatim_content": mem.get("verbatim_content"),
             }.items() if v is not None}
             return {
                 "id": mem.get("id") or _stable_id_from_mem(mem),
@@ -261,6 +262,12 @@ class BaseImporter:
                     imported = int(body.get("imported", 0))
                     skipped = int(body.get("skipped", 0))
                     failed = int(body.get("failed", 0))
+                    failed += sum(
+                        int(v) for v in (body.get("sidecars_failed") or {}).values()
+                    )
+                    failed += sum(
+                        int(v) for v in (body.get("unsupported_kinds") or {}).values()
+                    )
                     ok += imported
                     fail += failed
                     print(f"  batch {start//self.MPF_BATCH_SIZE + 1}: "
@@ -329,7 +336,12 @@ class BaseImporter:
                             f"  sidecar  {k}: imported={s_imp.get(k, 0)} "
                             f"skipped={s_skip.get(k, 0)} failed={s_fail.get(k, 0)}"
                         )
-                return imported, failed
+                reported_failures = failed
+                reported_failures += sum(int(v) for v in s_fail.values())
+                reported_failures += sum(
+                    int(v) for v in (body.get("unsupported_kinds") or {}).values()
+                )
+                return imported, reported_failures
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             print(f"  WARNING  /v1/import HTTP {exc.code}: {detail}")
@@ -1147,7 +1159,7 @@ class StatsCommand:
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
 
-    def run(self) -> None:
+    def run(self) -> int:
         url = f"{self.endpoint}/stats"
         headers = {"Accept": "application/json"}
         if self.api_key:
@@ -1159,10 +1171,10 @@ class StatsCommand:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             print(f"ERROR: HTTP {exc.code}: {exc.reason}", file=sys.stderr)
-            return
+            return 1
         except urllib.error.URLError as exc:
             print(f"ERROR: {exc.reason}", file=sys.stderr)
-            return
+            return 1
 
         # Pretty-print
         print("\n=== MNEMOS Statistics ===\n")
@@ -1194,6 +1206,7 @@ class StatsCommand:
                 print(f"    {k}: {v}")
 
         print()
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1297,7 +1310,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -1320,7 +1333,7 @@ def main(argv=None):
             jsonl=getattr(args, "jsonl", False),
             **common,
         )
-        importer.run()
+        result = importer.run()
 
     elif args.subcommand == "csv":
         importer = CsvImporter(
@@ -1333,14 +1346,14 @@ def main(argv=None):
             dry_run=args.dry_run,
             **common,
         )
-        importer.run()
+        result = importer.run()
 
     elif args.subcommand == "chatgpt":
         kwargs = dict(dry_run=args.dry_run, **common)
         if args.category:
             kwargs["category"] = args.category
         importer = ChatGPTImporter(file_path=args.file, **kwargs)
-        importer.run()
+        result = importer.run()
 
     elif args.subcommand == "obsidian":
         importer = ObsidianImporter(
@@ -1349,7 +1362,7 @@ def main(argv=None):
             dry_run=args.dry_run,
             **common,
         )
-        importer.run()
+        result = importer.run()
 
     elif args.subcommand == "text":
         importer = TextImporter(
@@ -1360,7 +1373,7 @@ def main(argv=None):
             dry_run=args.dry_run,
             **common,
         )
-        importer.run()
+        result = importer.run()
 
     elif args.subcommand == "mif":
         importer = MifImporter(
@@ -1368,12 +1381,14 @@ def main(argv=None):
             dry_run=getattr(args, "dry_run", False),
             **common,
         )
-        importer.run()
+        result = importer.run()
 
     elif args.subcommand == "stats":
         cmd = StatsCommand(endpoint=args.endpoint, api_key=args.api_key)
-        cmd.run()
+        return cmd.run()
+
+    return 1 if int((result or {}).get("failed", 0)) else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

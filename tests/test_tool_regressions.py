@@ -10,7 +10,8 @@ from types import ModuleType
 import pytest
 
 from mnemos.tools import docling_import, mpf_validate
-from mnemos.tools.memory_import import MifImporter
+from mnemos.tools.memory_import import BaseImporter, JsonImporter, MifImporter
+from mnemos.tools import memory_import
 from mnemos.tools.adapters import cognee, letta, mem0
 from mnemos.tools.adapters._mnemos_import import (
     import_totals_failed,
@@ -209,7 +210,7 @@ def test_mpf_validator_default_schema_is_packaged_and_validates_v01(tmp_path):
     assert mpf_validate.main(["--file", str(envelope), "--quiet"]) == 0
 
 
-def test_mpf_validator_falls_back_when_jsonschema_is_unavailable(monkeypatch):
+def test_mpf_validator_fails_closed_when_jsonschema_is_unavailable(monkeypatch):
     real_import = builtins.__import__
 
     def _without_jsonschema(name, *args, **kwargs):
@@ -224,7 +225,41 @@ def test_mpf_validator_falls_back_when_jsonschema_is_unavailable(monkeypatch):
         "records": [],
     }
 
-    assert mpf_validate.validate(env, {"type": "object"}) == []
+    assert mpf_validate.validate(env, {"type": "object"}) == [
+        "schema validation unavailable: jsonschema intentionally unavailable"
+    ]
+
+
+def test_memory_import_passthrough_counts_sidecar_and_unknown_kind_failures(monkeypatch):
+    response = {
+        "imported": 1,
+        "failed": 2,
+        "sidecars_failed": {"memory_versions": 3},
+        "unsupported_kinds": {"acme.observation": 4},
+    }
+    monkeypatch.setattr(
+        memory_import.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(response),
+    )
+    importer = BaseImporter(preserve_metadata=True)
+    importer.source_envelope = {"mpf_version": "0.1.1", "records": []}
+
+    assert importer._post_mpf_passthrough([{"content": "one"}]) == (1, 9)
+
+
+def test_memory_import_main_returns_nonzero_when_importer_reports_failures(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "memories.json"
+    source.write_text('[{"content": "one"}]')
+    monkeypatch.setattr(
+        JsonImporter,
+        "run",
+        lambda self: {"imported": 0, "failed": 3, "skipped": 0},
+    )
+
+    assert memory_import.main(["json", "--file", str(source)]) == 1
 
 
 def test_mif_preserve_metadata_keeps_recovered_fields(monkeypatch):

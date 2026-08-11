@@ -17,10 +17,9 @@ Exit codes:
   1 — validation failed (prose error list printed to stderr)
   2 — I/O or schema-load error
 
-Depends on the `jsonschema` package (pip install jsonschema). Falls
-back to structural-only checks if jsonschema isn't installed so the
-tool still catches gross shape errors in a dependency-minimal
-environment.
+The required `jsonschema` dependency performs authoritative validation.
+If it is unavailable in a broken installation, validation fails closed;
+operators can explicitly choose structural-only checks with --no-schema.
 """
 from __future__ import annotations
 
@@ -44,11 +43,7 @@ def _load_json(path: str) -> Any:
 
 
 def _structural_check(env: Any) -> List[str]:
-    """Minimal shape check that runs even without jsonschema installed.
-
-    Covers the required-fields rules in the spec so a missing
-    jsonschema dependency doesn't turn the validator into a no-op.
-    """
+    """Minimal shape check used before schema validation or by --no-schema."""
     errs: List[str] = []
     if not isinstance(env, dict):
         return ["envelope must be a JSON object"]
@@ -88,8 +83,8 @@ def _full_check(env: Any, schema: Any) -> List[str]:
     """Run the full JSON Schema validation via the jsonschema package."""
     try:
         from jsonschema.validators import Draft202012Validator
-    except ImportError:
-        return []
+    except ImportError as exc:
+        return [f"schema validation unavailable: {exc}"]
     try:
         validator = Draft202012Validator(schema)
     except Exception as exc:
@@ -103,7 +98,7 @@ def _full_check(env: Any, schema: Any) -> List[str]:
 
 def validate(env: Any, schema: Optional[Any]) -> List[str]:
     """Run structural + full schema checks. Structural always runs; full
-    runs only when jsonschema is installed and a schema was loaded."""
+    runs whenever a schema was loaded and fails if jsonschema is unavailable."""
     errs = _structural_check(env)
     # Avoid duplicating structural errors when full-schema would catch
     # the same thing; run full-schema only if structural passed.

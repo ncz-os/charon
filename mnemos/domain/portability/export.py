@@ -444,13 +444,35 @@ async def export_memories(
             offset=offset,
             include_secrets=include_secrets,
         )
+        # mnemos-core's portability projection predates verbatim_content and
+        # therefore cannot supply it to the record serializer.  Fetch the
+        # verified memories column in one PostgreSQL-gated batch so active and
+        # original text remain distinct across backup/restore.
+        row_dicts = [dict(r) for r in rows]
+        missing_verbatim_ids = [
+            row["id"] for row in row_dicts if "verbatim_content" not in row
+        ]
+        if missing_verbatim_ids:
+            verbatim_rows = await conn.fetch(
+                "SELECT id, verbatim_content FROM memories "
+                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
+                missing_verbatim_ids,
+            )
+            verbatim_by_id = {
+                row["id"]: row["verbatim_content"]
+                for row in verbatim_rows
+                if "verbatim_content" in row
+            }
+            for row in row_dicts:
+                if row["id"] in verbatim_by_id:
+                    row["verbatim_content"] = verbatim_by_id[row["id"]]
         records = [
             _memory_to_record(
-                dict(r),
+                r,
                 mpf_version=emit_version,
                 redact_secrets=redact_secrets,
             )
-            for r in rows
+            for r in row_dicts
         ]
         # Cross-tenant ID leak guard for v0.2 exports: Morpheus synthesis
         # builds source_memories from cluster members across namespaces,
@@ -480,7 +502,7 @@ async def export_memories(
         deletion_log_next_cursor: Optional[str] = None
 
         if include_sidecars:
-            memory_ids = [r["id"] for r in rows]
+            memory_ids = [r["id"] for r in row_dicts]
             kg_rows = await repo.fetch_kg_triples_for_export(
                 conn,
                 memory_ids=memory_ids,
