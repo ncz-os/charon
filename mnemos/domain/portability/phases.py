@@ -311,7 +311,11 @@ async def _import_memory_versions(
                     expected_branch = entry.get("branch") or "main"
                     expected_merge_parents = entry.get("merge_parents") or None
                     expected_change_type = entry.get("change_type") or "create"
-                    expected_permission_mode = entry.get("permission_mode") or 600
+                    expected_permission_mode = (
+                        600
+                        if entry.get("permission_mode") is None
+                        else entry["permission_mode"]
+                    )
                     actual_merge_parents = existing["merge_parents"] if existing else None
 
                     def _norm_mp(mp):

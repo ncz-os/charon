@@ -289,7 +289,7 @@ def test_memory_to_record_preserves_distinct_verbatim_content_and_redacts_it():
     assert secret not in redacted.payload["verbatim_content"]
 
 
-def test_memory_to_record_restores_imported_v02_fields_without_leaking_bridge():
+def test_memory_to_record_does_not_trust_user_metadata_as_v02_provenance():
     fields = {
         "provenance": {
             "wasAttributedTo": {"type": "user", "id": "alice"},
@@ -314,13 +314,18 @@ def test_memory_to_record_restores_imported_v02_fields_without_leaking_bridge():
 
     record = _memory_to_record(row, mpf_version="0.2.0")
 
-    assert record.provenance == fields["provenance"]
-    assert record.valid_time_start == fields["valid_time_start"]
-    assert record.valid_time_end == fields["valid_time_end"]
-    assert record.transaction_time == fields["transaction_time"]
+    assert record.provenance != fields["provenance"]
+    assert record.provenance["wasAttributedTo"] == {"type": "user", "id": "alice"}
+    assert record.valid_time_start == "2026-05-06T12:00:00+00:00"
+    assert record.valid_time_end is None
+    assert record.transaction_time == "2026-05-06T12:00:00+00:00"
     assert record.payload["metadata"] == {
         "customer": "kept",
-        "_mnemos_charon_mpf_v0_2_record_fields": "customer-owned-value",
+        "_mnemos_charon_mpf_v0_2_record_fields": {
+            "record_fields": fields,
+            "original_metadata_value_present": True,
+            "original_metadata_value": "customer-owned-value",
+        },
     }
 
 

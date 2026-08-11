@@ -389,6 +389,7 @@ class JsonImporter(BaseImporter):
         self.file_path = Path(file_path)
         # Explicit jsonl flag wins; otherwise infer from extension.
         self.jsonl = jsonl or self.file_path.suffix.lower() == ".jsonl"
+        self._input_failures = 0
 
     def _parse_source(self) -> list:
         """Return a list of raw memory dicts regardless of input shape."""
@@ -405,7 +406,13 @@ class JsonImporter(BaseImporter):
             # finding: silently dropping these is wrong).
             flat_memory_lines: list = []
             jsonl_sidecars: Dict[str, list] = {}
-            with self.file_path.open(encoding="utf-8") as f:
+            try:
+                source = self.file_path.open(encoding="utf-8")
+            except OSError as exc:
+                print(f"ERROR: Cannot read {self.file_path}: {exc}", file=sys.stderr)
+                self._input_failures += 1
+                return []
+            with source as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
@@ -415,6 +422,7 @@ class JsonImporter(BaseImporter):
                     except json.JSONDecodeError as exc:
                         print(f"WARNING: line {line_num}: bad JSON ({exc})",
                               file=sys.stderr)
+                        self._input_failures += 1
                         continue
                     # CHARON sidecar trailer:
                     # memory_export.py jsonl mode emits a final line
@@ -538,11 +546,17 @@ class JsonImporter(BaseImporter):
                 )
             return items
 
-        raw = self.file_path.read_text(encoding="utf-8")
+        try:
+            raw = self.file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: Cannot read {self.file_path}: {exc}", file=sys.stderr)
+            self._input_failures += 1
+            return []
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
             print(f"ERROR: Cannot parse JSON: {exc}", file=sys.stderr)
+            self._input_failures += 1
             return []
 
         # MPF envelope → flatten records back to payload dicts
@@ -600,12 +614,17 @@ class JsonImporter(BaseImporter):
         if not isinstance(data, list):
             print("ERROR: JSON must be an array, wrapped object, or MPF envelope",
                   file=sys.stderr)
+            self._input_failures += 1
             return []
         return data
 
     def run(self) -> dict:
         stats = {"imported": 0, "failed": 0, "skipped": 0}
         raw_items = self._parse_source()
+        if self._input_failures and not raw_items:
+            stats["failed"] = self._input_failures
+            print(f"Result: 0 imported, {stats['failed']} failed")
+            return stats
 
         memories = []
         for item in raw_items:
@@ -638,8 +657,8 @@ class JsonImporter(BaseImporter):
 
         ok, fail = self._post(memories)
         stats["imported"] = ok
-        stats["failed"] = fail
-        print(f"Result: {ok} imported, {fail} failed")
+        stats["failed"] = fail + self._input_failures
+        print(f"Result: {ok} imported, {stats['failed']} failed")
         return stats
 
 
@@ -671,8 +690,9 @@ class CsvImporter(BaseImporter):
 
         try:
             fh = self.file_path.open(newline="", encoding="utf-8-sig")
-        except FileNotFoundError:
-            print(f"ERROR: File not found: {self.file_path}", file=sys.stderr)
+        except OSError as exc:
+            print(f"ERROR: Cannot read {self.file_path}: {exc}", file=sys.stderr)
+            stats["failed"] = 1
             return stats
 
         with fh:
@@ -680,6 +700,7 @@ class CsvImporter(BaseImporter):
             if self.content_col not in (reader.fieldnames or []):
                 print(f"ERROR: Column '{self.content_col}' not in CSV. "
                       f"Available: {reader.fieldnames}", file=sys.stderr)
+                stats["failed"] = 1
                 return stats
 
             memories = []
@@ -765,18 +786,21 @@ class ChatGPTImporter(BaseImporter):
 
         try:
             raw = self.file_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            print(f"ERROR: File not found: {self.file_path}", file=sys.stderr)
+        except OSError as exc:
+            print(f"ERROR: Cannot read {self.file_path}: {exc}", file=sys.stderr)
+            stats["failed"] = 1
             return stats
 
         try:
             conversations = json.loads(raw)
         except json.JSONDecodeError as exc:
             print(f"ERROR: Cannot parse JSON: {exc}", file=sys.stderr)
+            stats["failed"] = 1
             return stats
 
         if not isinstance(conversations, list):
             print("ERROR: Expected a top-level JSON array of conversations", file=sys.stderr)
+            stats["failed"] = 1
             return stats
 
         memories = []
@@ -933,6 +957,7 @@ class ObsidianImporter(BaseImporter):
 
         if not self.vault_path.is_dir():
             print(f"ERROR: Not a directory: {self.vault_path}", file=sys.stderr)
+            stats["failed"] = 1
             return stats
 
         md_files = [
@@ -949,6 +974,7 @@ class ObsidianImporter(BaseImporter):
             except Exception as exc:
                 print(f"  SKIP  {fpath.name}: cannot read ({exc})")
                 stats["skipped"] += 1
+                stats["failed"] += 1
                 continue
 
             fm, body = _parse_yaml_frontmatter(text)
@@ -998,8 +1024,8 @@ class ObsidianImporter(BaseImporter):
 
         ok, fail = self._post(memories)
         stats["imported"] = ok
-        stats["failed"] = fail
-        print(f"Result: {ok} imported, {fail} failed")
+        stats["failed"] += fail
+        print(f"Result: {ok} imported, {stats['failed']} failed")
         return stats
 
 
@@ -1025,12 +1051,14 @@ class TextImporter(BaseImporter):
         self.per_paragraph = per_paragraph
         self.min_paragraph_chars = min_paragraph_chars
         self.recursive = recursive
+        self._invalid_source = False
 
     def _collect_files(self) -> list:
         if self.source.is_file():
             return [self.source]
         if not self.source.is_dir():
             print(f"ERROR: Not a file or directory: {self.source}", file=sys.stderr)
+            self._invalid_source = True
             return []
         glob = "**/*" if self.recursive else "*"
         return sorted(
@@ -1044,6 +1072,8 @@ class TextImporter(BaseImporter):
         files = self._collect_files()
         if not files:
             print(f"No supported files found in {self.source}")
+            if self._invalid_source:
+                stats["failed"] = 1
             return stats
 
         print(f"Found {len(files)} file(s)")
@@ -1055,6 +1085,7 @@ class TextImporter(BaseImporter):
             except Exception as exc:
                 print(f"  SKIP  {fpath.name}: cannot read ({exc})")
                 stats["skipped"] += 1
+                stats["failed"] += 1
                 continue
 
             if not text:
@@ -1091,8 +1122,8 @@ class TextImporter(BaseImporter):
 
         ok, fail = self._post(memories)
         stats["imported"] = ok
-        stats["failed"] = fail
-        print(f"Result: {ok} imported, {fail} failed")
+        stats["failed"] += fail
+        print(f"Result: {ok} imported, {stats['failed']} failed")
         return stats
 
 
@@ -1111,6 +1142,11 @@ class MifImporter(BaseImporter):
         self.source = source
 
     def run(self) -> dict:
+        source_path = Path(self.source)
+        if not source_path.is_dir():
+            print(f"ERROR: Not a directory: {source_path}", file=sys.stderr)
+            return {"imported": 0, "failed": 1, "skipped": 0}
+
         from mnemos.portability import charon as mif_charon
 
         memories = mif_charon.import_bundle(self.source)

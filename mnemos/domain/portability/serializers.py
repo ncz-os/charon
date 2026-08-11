@@ -192,22 +192,8 @@ def _memory_to_record(
         except Exception:
             metadata = {"_raw": metadata}
 
-    imported_v0_2_fields = None
     if isinstance(metadata, dict):
         metadata = dict(metadata)
-        bridge = metadata.pop(
-            _MPF_V0_2_RECORD_FIELDS_METADATA_KEY,
-            None,
-        )
-        if isinstance(bridge, dict) and isinstance(bridge.get("record_fields"), dict):
-            imported_v0_2_fields = bridge["record_fields"]
-            if bridge.get("original_metadata_value_present"):
-                metadata[_MPF_V0_2_RECORD_FIELDS_METADATA_KEY] = bridge.get(
-                    "original_metadata_value"
-                )
-        elif isinstance(bridge, dict):
-            # Read the direct bridge shape emitted by early v0.2 import builds.
-            imported_v0_2_fields = bridge
 
     if redact_secrets:
         metadata = _redact_secret_strings(metadata)
@@ -257,34 +243,21 @@ def _memory_to_record(
     # null per the spec's "MNEMOS importers default valid_time_start to
     # transaction_time" guidance.
     if mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
-        if isinstance(imported_v0_2_fields, dict):
-            provenance = imported_v0_2_fields.get("provenance")
-            if redact_secrets:
-                provenance = _redact_secret_strings(provenance)
-            record_kwargs["provenance"] = provenance or _record_provenance_v0_2(
-                provenance_row
-            )
-            record_kwargs["transaction_time"] = imported_v0_2_fields.get(
-                "transaction_time"
-            )
-            record_kwargs["valid_time_start"] = imported_v0_2_fields.get(
-                "valid_time_start"
-            )
-            record_kwargs["valid_time_end"] = imported_v0_2_fields.get(
-                "valid_time_end"
-            )
+        # Metadata is user-controlled, including the key used by older
+        # import builds as a v0.2 record-field bridge.  It cannot authenticate
+        # provenance.  Preserve it as payload metadata, but
+        # never promote values from it into trusted record-level fields.
+        record_kwargs["provenance"] = _record_provenance_v0_2(provenance_row)
+        record_kwargs["transaction_time"] = _iso(row.get("created"))
+        valid_time_meta = metadata.get("valid_time") if isinstance(metadata, dict) else None
+        if isinstance(valid_time_meta, dict):
+            vt_start = _iso(valid_time_meta.get("start"))
+            vt_end = _iso(valid_time_meta.get("end"))
+            record_kwargs["valid_time_start"] = vt_start or _iso(row.get("created"))
+            record_kwargs["valid_time_end"] = vt_end  # may be None
         else:
-            record_kwargs["provenance"] = _record_provenance_v0_2(provenance_row)
-            record_kwargs["transaction_time"] = _iso(row.get("created"))
-            valid_time_meta = metadata.get("valid_time") if isinstance(metadata, dict) else None
-            if isinstance(valid_time_meta, dict):
-                vt_start = _iso(valid_time_meta.get("start"))
-                vt_end = _iso(valid_time_meta.get("end"))
-                record_kwargs["valid_time_start"] = vt_start or _iso(row.get("created"))
-                record_kwargs["valid_time_end"] = vt_end  # may be None
-            else:
-                record_kwargs["valid_time_start"] = _iso(row.get("created"))
-                # valid_time_end stays None (open-ended/current)
+            record_kwargs["valid_time_start"] = _iso(row.get("created"))
+            # valid_time_end stays None (open-ended/current)
 
     return MPFRecord(**record_kwargs)
 

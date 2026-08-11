@@ -262,7 +262,36 @@ def test_memory_import_main_returns_nonzero_when_importer_reports_failures(
     assert memory_import.main(["json", "--file", str(source)]) == 1
 
 
-def test_mif_preserve_metadata_keeps_recovered_fields(monkeypatch):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["json", "--file", "{path}"],
+        ["csv", "--file", "{path}", "--content-col", "content"],
+        ["chatgpt", "--file", "{path}"],
+        ["obsidian", "--vault", "{path}"],
+        ["text", "--source", "{path}"],
+        ["mif", "--source", "{path}"],
+    ],
+)
+def test_memory_import_main_returns_nonzero_for_missing_local_input(tmp_path, argv):
+    missing = tmp_path / "missing"
+    resolved = [part.format(path=str(missing)) for part in argv]
+    assert memory_import.main(resolved) == 1
+
+
+def test_memory_import_main_returns_nonzero_for_malformed_json(tmp_path):
+    source = tmp_path / "broken.json"
+    source.write_text('{"truncated":')
+    assert memory_import.main(["json", "--file", str(source)]) == 1
+
+
+def test_memory_import_empty_valid_json_is_success(tmp_path):
+    source = tmp_path / "empty.json"
+    source.write_text("[]")
+    assert memory_import.main(["json", "--file", str(source), "--dry-run"]) == 0
+
+
+def test_mif_preserve_metadata_keeps_recovered_fields(monkeypatch, tmp_path):
     portability_module = ModuleType("mnemos.portability")
     charon_module = ModuleType("mnemos.portability.charon")
     charon_module.import_bundle = lambda source: [{
@@ -286,7 +315,9 @@ def test_mif_preserve_metadata_keeps_recovered_fields(monkeypatch):
         "_post",
         lambda self, rows: (captured.setdefault("rows", rows), (len(rows), 0))[1],
     )
-    MifImporter(source="/unused", preserve_metadata=True).run()
+    source = tmp_path / "bundle"
+    source.mkdir()
+    MifImporter(source=str(source), preserve_metadata=True).run()
 
     row = captured["rows"][0]
     assert row["id"] == "mem-original"

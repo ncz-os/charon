@@ -28,7 +28,6 @@ from .schemas import (
     ImportStats,
     MPFEnvelope,
 )
-from .serializers import _MPF_V0_2_RECORD_FIELDS_METADATA_KEY
 from .timestamps import _parse_iso_naive
 
 logger = logging.getLogger(__name__)
@@ -45,6 +44,22 @@ def _new_stats() -> ImportStats:
         sidecars_failed={},
         errors=[],
     )
+
+
+async def _fetch_verbatim_content_for_legacy_core(conn, memory_id: str):
+    """Read a field omitted by older core portability projections.
+
+    CHARON's HTTP portability routes are PostgreSQL-gated, so this query uses
+    asyncpg's ``$1`` paramstyle.  Once the minimum core version includes
+    ``verbatim_content`` in ``fetch_memory_by_id``, this compatibility query is
+    no longer reached.
+    """
+    row = await conn.fetchrow(
+        "SELECT verbatim_content FROM memories "
+        "WHERE id = $1 AND deleted_at IS NULL",
+        memory_id,
+    )
+    return row["verbatim_content"] if row is not None else None
 
 
 def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) -> None:
@@ -204,21 +219,6 @@ async def import_memories(
                 rejected_persisted_ids.add(record.id)
                 continue
             metadata = dict(metadata)
-            if envelope.mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
-                bridge = {
-                    "record_fields": {
-                        "provenance": record.provenance,
-                        "valid_time_start": record.valid_time_start,
-                        "valid_time_end": record.valid_time_end,
-                        "transaction_time": record.transaction_time,
-                    },
-                }
-                if _MPF_V0_2_RECORD_FIELDS_METADATA_KEY in metadata:
-                    bridge["original_metadata_value_present"] = True
-                    bridge["original_metadata_value"] = metadata[
-                        _MPF_V0_2_RECORD_FIELDS_METADATA_KEY
-                    ]
-                metadata[_MPF_V0_2_RECORD_FIELDS_METADATA_KEY] = bridge
             quality_rating = p.get("quality_rating")
             if quality_rating is None:
                 quality_rating = 75
@@ -300,7 +300,9 @@ async def import_memories(
                         try:
                             existing_verbatim = existing_mem["verbatim_content"]
                         except (KeyError, IndexError):
-                            existing_verbatim = existing_mem["content"]
+                            existing_verbatim = await _fetch_verbatim_content_for_legacy_core(
+                                conn, persisted_id
+                            )
                         checks = [
                             ("content", existing_mem["content"], content),
                             ("category", existing_mem["category"], category),

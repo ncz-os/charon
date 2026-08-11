@@ -867,7 +867,7 @@ def test_import_rejects_non_object_memory_payload_without_crashing():
     assert conn.executes == []
 
 
-def test_import_preserves_v02_record_fields_in_metadata_bridge(monkeypatch):
+def test_import_does_not_replace_customer_metadata_with_v02_bridge(monkeypatch):
     conn = _Conn()
     _install(monkeypatch, conn)
     record = _memory_record()
@@ -896,14 +896,8 @@ def test_import_preserves_v02_record_fields_in_metadata_bridge(monkeypatch):
     assert stats.imported == 1
     insert_args = next(args for sql, args in conn.executes if "INSERT INTO memories" in sql)
     metadata = __import__("json").loads(insert_args[4])
-    bridge = metadata["_mnemos_charon_mpf_v0_2_record_fields"]
-    assert bridge["original_metadata_value_present"] is True
-    assert bridge["original_metadata_value"] == "customer-owned-value"
-    assert bridge["record_fields"] == {
-        "provenance": record.provenance,
-        "valid_time_start": record.valid_time_start,
-        "valid_time_end": record.valid_time_end,
-        "transaction_time": record.transaction_time,
+    assert metadata == {
+        "_mnemos_charon_mpf_v0_2_record_fields": "customer-owned-value"
     }
 
 
@@ -1219,6 +1213,7 @@ def test_import_idempotent_on_id_collision(monkeypatch):
                     "source_provider": None,
                     "source_session": None,
                     "source_agent": None,
+                    "verbatim_content": "body",
                     "created": None,
                     "updated": None,
                 },
@@ -1237,6 +1232,59 @@ def test_import_idempotent_on_id_collision(monkeypatch):
     )
     assert stats.imported == 0
     assert stats.skipped == 1
+
+
+def test_import_idempotent_collision_reads_distinct_verbatim_from_legacy_core(monkeypatch):
+    """Older core projections omit verbatim_content on conflict retries."""
+
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+
+    existing = {
+        "content": "compressed summary",
+        "category": "solutions",
+        "subcategory": None,
+        "metadata": {},
+        "quality_rating": 75,
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "permission_mode": 600,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+        "created": None,
+        "updated": None,
+    }
+    conn = _DupeConn(
+        routed_rows={
+            "SELECT content, category": [existing],
+            "SELECT verbatim_content FROM memories": [
+                {"verbatim_content": "full original evidence"}
+            ],
+        }
+    )
+    _install(monkeypatch, conn)
+    record = _memory_record(id="mem_dupe_verbatim")
+    record.payload["content"] = "compressed summary"
+    record.payload["verbatim_content"] = "full original evidence"
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=_envelope([record]),
+            preserve_owner=False,
+            user=_alice(),
+        )
+    )
+
+    assert stats.failed == 0
+    assert stats.skipped == 1
+    assert any(
+        "SELECT verbatim_content FROM memories" in sql
+        for sql, _ in conn.fetch_calls
+    )
 
 
 def test_import_rejected_conflict_blocks_sidecar_attachment(monkeypatch):
@@ -1283,6 +1331,7 @@ def test_import_rejected_conflict_blocks_sidecar_attachment(monkeypatch):
                     "source_provider": None,
                     "source_session": None,
                     "source_agent": None,
+                    "verbatim_content": "body",
                     "created": None,
                     "updated": None,
                 },
@@ -1360,6 +1409,7 @@ def test_import_rejects_conflict_on_stale_permission_mode(monkeypatch):
                     "source_provider": None,
                     "source_session": None,
                     "source_agent": None,
+                    "verbatim_content": "body",
                     "created": None,
                     "updated": None,
                 },
@@ -1997,6 +2047,9 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
     # memory_versions row matches the envelope claim. Seed a matching
     # row so the idempotent re-import test still passes.
     mv_entry = _mv_sidecar_entry()
+    # Zero is a valid octal-style permission mode.  The conflict check must
+    # default only None, not treat this value as absent.
+    mv_entry["permission_mode"] = 0
     matching_existing = {
         "memory_id": mv_entry["record_id"],
         "owner_id": "alice",
@@ -2011,7 +2064,7 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         "subcategory": mv_entry.get("subcategory"),
         "metadata": mv_entry.get("metadata") or {},
         "verbatim_content": mv_entry.get("verbatim_content"),
-        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "permission_mode": mv_entry["permission_mode"],
         "source_model": mv_entry.get("source_model"),
         "source_provider": mv_entry.get("source_provider"),
         "source_session": mv_entry.get("source_session"),
@@ -2567,6 +2620,7 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
                     "source_provider": None,
                     "source_session": None,
                     "source_agent": None,
+                    "verbatim_content": "body",
                     "created": None,
                     "updated": None,
                 },
