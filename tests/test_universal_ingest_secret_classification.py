@@ -9,7 +9,7 @@ from mnemos.core.secret_detection import SecretClass, VAULT_NAMESPACE, classify
 from mnemos.domain.models import BulkCreateRequest, MemoryCreateRequest, MemorySearchRequest, MemoryUpdateRequest
 
 
-SECRET_TEXT = "INFRASTRUCTURE CREDENTIALS: TYPHON root login password is ***REMOVED-CREDENTIAL***"
+SECRET_TEXT = "INFRASTRUCTURE CREDENTIALS: TYPHON root login password is DenylistSelfTest2NotReal99"
 RECORD_TOKEN_TEXT = "INFRASTRUCTURE CREDENTIALS: alice/Tr0ub4dor&3"
 RECORD_TOKEN_LITERAL = "Tr0ub4dor&3"
 
@@ -61,7 +61,7 @@ class _Root:
 async def _assert_vaulted_and_not_plaintext_searchable(
     backend,
     memory_id: str,
-    literal: str = "***REMOVED-CREDENTIAL***",
+    literal: str = "DenylistSelfTest2NotReal99",
 ):
     from mnemos.persistence.visibility import VisibilityFilter
 
@@ -156,12 +156,12 @@ async def test_route_search_default_discovers_vaulted_secret_redacted(sqlite_bac
         user=_User(),
     )
     search = await search_memories(
-        MemorySearchRequest(query="***REMOVED-CREDENTIAL***", semantic=False, limit=20),
+        MemorySearchRequest(query="DenylistSelfTest2NotReal99", semantic=False, limit=20),
         user=_Root(),
     )
     discovered = next(m for m in search.memories if m.id == resp.memory_ids[0])
     assert discovered.vaulted is True
-    assert "***REMOVED-CREDENTIAL***" not in discovered.content
+    assert "DenylistSelfTest2NotReal99" not in discovered.content
     assert "[REDACTED]" in discovered.content
 
 
@@ -178,7 +178,7 @@ def test_federation_nats_event_classifies_content_verbatim_and_compressed():
         {
             "content": "normal content",
             "verbatim_content": SECRET_TEXT,
-            "compressed_content": "compressed root password ***REMOVED-CREDENTIAL***",
+            "compressed_content": "compressed root password DenylistSelfTest@NotARealSecret1",
             "namespace": "default",
             "metadata": {},
         },

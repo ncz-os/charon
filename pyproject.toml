@@ -6,6 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "mnemos-charon"
 version = "0.1.0"
 description = "Extracted CHARON portability subsystem for the Mnemos namespace: the MPF (Memory Portability Format) standard, import/export, migrate-in adapters for foreign memory systems, and Docling document ingestion."
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "MNEMOS Contributors" }]
+maintainers = [{ name = "Jason Perlow", email = "jperlow@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
