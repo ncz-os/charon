@@ -16,6 +16,7 @@ Library usage:
 """
 
 import argparse
+from collections import Counter
 import json
 import re
 import sys
@@ -168,7 +169,7 @@ class DoclingImporter:
         # ids (a file re-imported on the same importer, or a symlink + its target)
         # would collapse/overwrite concepts. Fail loudly with the offenders.
         ids = [m.get("id") for m in self.collected]
-        dups = sorted({i for i in ids if ids.count(i) > 1})
+        dups = sorted(i for i, count in Counter(ids).items() if count > 1)
         if dups:
             raise RuntimeError(
                 "duplicate MIF source ids staged (re-imported document or "

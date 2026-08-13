@@ -449,6 +449,7 @@ async def export_memories(
         # verified memories column in one PostgreSQL-gated batch so active and
         # original text remain distinct across backup/restore.
         row_dicts = [dict(r) for r in rows]
+        del rows
         missing_verbatim_ids = [
             row["id"] for row in row_dicts if "verbatim_content" not in row
         ]
@@ -463,6 +464,7 @@ async def export_memories(
                 for row in verbatim_rows
                 if "verbatim_content" in row
             }
+            del verbatim_rows
             for row in row_dicts:
                 if row["id"] in verbatim_by_id:
                     row["verbatim_content"] = verbatim_by_id[row["id"]]
@@ -521,6 +523,7 @@ async def export_memories(
                 )
                 for r in kg_rows
             ]
+            del kg_rows
 
             mv_rows = await repo.fetch_memory_versions_for_export(
                 conn,
@@ -541,6 +544,7 @@ async def export_memories(
                     for r in mv_rows
                 ]
             )
+            del mv_rows
 
             cv_rows = await repo.fetch_compressed_variants_for_export(
                 conn,
@@ -557,6 +561,7 @@ async def export_memories(
                 )
                 for r in cv_rows
             ]
+            del cv_rows
 
             # deletion_log: v0.2-only. The v0.1 spec has no deletion_log
             # sidecar, and the v0.1 envelope shouldn't carry it. Scope by
@@ -639,6 +644,7 @@ async def export_memories(
                     )
                     if entry and entry.get("deleted_at")
                 ]
+                del dl_rows
 
     return MPFEnvelope(
         mpf_version=emit_version,

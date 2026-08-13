@@ -2732,6 +2732,57 @@ def test_import_memory_versions_rejects_cross_tenant_parent(monkeypatch):
     assert not any("INSERT INTO memory_versions" in e[0] for e in conn.executes)
 
 
+def test_import_memory_versions_prefetches_all_parents_once(monkeypatch):
+    """Large version sidecars must not query parent DB truth per entry."""
+    parent_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    conn = _Conn(
+        routed_rows={
+            "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+            "FROM memory_versions WHERE id = ANY": [
+                {
+                    "id": parent_uuid,
+                    "memory_id": "mem_alice1",
+                    "owner_id": "alice",
+                    "namespace": "alice-ns",
+                },
+            ],
+            "SELECT DISTINCT memory_id FROM memory_versions": [
+                {"memory_id": "mem_alice1"},
+            ],
+        }
+    )
+    _install(monkeypatch, conn)
+
+    first = {
+        **_mv_sidecar_entry(),
+        "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "version_num": 2,
+        "parent_version_id": parent_uuid,
+    }
+    second = {
+        **_mv_sidecar_entry(),
+        "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "version_num": 3,
+        "parent_version_id": parent_uuid,
+    }
+    env = portability.MPFEnvelope(records=[], memory_versions=[first, second])
+
+    stats = asyncio.run(
+        portability.import_memories(
+            envelope=env,
+            preserve_owner=True,
+            user=_root(),
+        )
+    )
+
+    assert stats.sidecars_imported == {"memory_versions": 2}
+    parent_fetches = [
+        sql for sql, _ in conn.fetch_calls
+        if "FROM memory_versions WHERE id = ANY" in sql
+    ]
+    assert len(parent_fetches) == 1
+
+
 def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
     """Codex round-12 finding: ON CONFLICT (id) DO NOTHING means
     an envelope-supplied 'parent' entry with a UUID that already

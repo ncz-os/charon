@@ -1,6 +1,8 @@
 """Document import utilities using Docling for intelligent content extraction."""
 
+import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -12,13 +14,41 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
+# Checking the top-level package spec avoids importing Docling's document/ML
+# dependency graph on every API startup.  The concrete classes are loaded by
+# ``_load_docling`` only when the first document request constructs an importer.
 try:
-    from docling.datamodel.base_models import DocumentStream
-    from docling.document_converter import DocumentConverter
-
-    DOCLING_AVAILABLE = True
-except ImportError:
+    DOCLING_AVAILABLE = importlib.util.find_spec("docling") is not None
+except (ImportError, ValueError):
+    # ValueError is possible when an embedding application has installed a
+    # synthetic ``docling`` module without a module spec.
     DOCLING_AVAILABLE = False
+DocumentStream = None
+DocumentConverter = None
+
+
+def _load_docling() -> None:
+    """Load Docling classes on first use, keeping normal API startup light."""
+    global DocumentStream, DocumentConverter
+    if DocumentStream is None:
+        from docling.datamodel.base_models import DocumentStream as _DocumentStream
+
+        DocumentStream = _DocumentStream
+    if DocumentConverter is None:
+        from docling.document_converter import DocumentConverter as _DocumentConverter
+
+        DocumentConverter = _DocumentConverter
+
+
+def _docling_max_concurrency() -> int:
+    """Return the configurable process-wide conversion concurrency bound.
+
+    Conversion previously ran synchronously on the event loop, which
+    effectively serialized requests.  A default of one preserves that memory
+    and throughput behavior while allowing unrelated async requests to run.
+    """
+    return _positive_int(os.environ.get("MNEMOS_DOCLING_MAX_CONCURRENCY")) or 1
+
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
@@ -74,6 +104,9 @@ def _positive_int(raw: Any) -> int | None:
     return value if value > 0 else None
 
 
+_docling_conversion_semaphore = asyncio.Semaphore(_docling_max_concurrency())
+
+
 def _document_import_max_bytes() -> int:
     env_limit = _positive_int(os.environ.get("MNEMOS_DOCUMENT_IMPORT_MAX_BYTES"))
     if env_limit is not None:
@@ -117,6 +150,7 @@ class DoclingImporter:
     def __init__(self):
         if not DOCLING_AVAILABLE:
             raise ImportError("Docling not installed. Install with: pip install mnemos-os[docling]")
+        _load_docling()
         self.converter = DocumentConverter()
 
     def parse_document(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
@@ -338,9 +372,25 @@ async def import_memories_from_document(
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Parse with Docling
-    importer = DoclingImporter()
-    full_text, doc_metadata, chunks = importer.parse_document(content, file.filename or "document")
+    # Docling conversion is synchronous and can hold a large parsed document
+    # graph. Run it off the event loop and retain the prior effective
+    # process-wide concurrency of one by default. Operators with measured
+    # headroom can raise MNEMOS_DOCLING_MAX_CONCURRENCY.
+    try:
+        importer = DoclingImporter()
+    except ImportError as exc:
+        # A broken/partial optional installation can have a top-level package
+        # spec while one of Docling's concrete modules is unavailable.
+        raise HTTPException(
+            status_code=501,
+            detail="Docling not installed. Install with: pip install mnemos-os[docling]",
+        ) from exc
+    async with _docling_conversion_semaphore:
+        full_text, doc_metadata, chunks = await asyncio.to_thread(
+            importer.parse_document,
+            content,
+            file.filename or "document",
+        )
     archive_reason = _archive_snapshot_reason(
         file.filename,
         full_text,

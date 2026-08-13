@@ -18,14 +18,16 @@ async def _validate_version_parents(
     preserve_owner: bool = True,
     require_in_envelope: bool = False,
     freshly_inserted_uuids: Optional[set] = None,
+    db_truth: Optional[Dict[str, tuple]] = None,
 ) -> tuple:
     if not parent_uuids:
         return True, []
 
-    rows = await repo.fetch_memory_versions_by_ids(conn, parent_uuids)
-    db_truth: Dict[str, tuple] = {
-        r["id"]: (r["memory_id"], r["owner_id"], r["namespace"]) for r in rows
-    }
+    if db_truth is None:
+        rows = await repo.fetch_memory_versions_by_ids(conn, parent_uuids)
+        db_truth = {
+            r["id"]: (r["memory_id"], r["owner_id"], r["namespace"]) for r in rows
+        }
     bad: List[str] = []
     for p in parent_uuids:
         if require_in_envelope:

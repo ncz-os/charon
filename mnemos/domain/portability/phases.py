@@ -220,6 +220,26 @@ async def _import_memory_versions(
 
     sidecar = _topo_sort_versions(sidecar)
     in_envelope_index = {str(e["id"]): e for e in sidecar if e.get("id")}
+    # Resolve every external or potentially shadowed parent in one query.
+    # Validation still consults DB truth before envelope claims, but avoids a
+    # fetch for every version entry in a large import.
+    parent_ids = {
+        str(parent_id)
+        for entry in sidecar
+        for parent_id in (
+            [entry.get("parent_version_id")] + list(entry.get("merge_parents") or [])
+        )
+        if parent_id
+    }
+    parent_rows = (
+        await repo.fetch_memory_versions_by_ids(conn, sorted(parent_ids))
+        if parent_ids
+        else []
+    )
+    parent_db_truth: Dict[str, tuple] = {
+        row["id"]: (row["memory_id"], row["owner_id"], row["namespace"])
+        for row in parent_rows
+    }
     for entry in sidecar:
         record_id_for_tracking = entry.get("record_id")
         for required in ("id", "record_id", "version_num", "content"):
@@ -266,6 +286,7 @@ async def _import_memory_versions(
                     preserve_owner=preserve_owner,
                     require_in_envelope=require_in_envelope,
                     freshly_inserted_uuids=freshly_inserted_version_uuids,
+                    db_truth=parent_db_truth,
                 )
                 if not ok:
                     _bump(stats.sidecars_failed, surface)
