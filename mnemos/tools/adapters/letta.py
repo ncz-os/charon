@@ -174,22 +174,90 @@ class _LettaClient:
             raise SystemExit(f"Letta GET {path} → HTTP {e.code}: {body}")
 
     def list_agents(self, limit: int = 500) -> List[Dict[str, Any]]:
-        return self._get("/v1/agents", {"limit": limit}) or []
+        return _paginated_get(
+            self, "/v1/agents", {"limit": limit}, result_key="agents",
+        ) or []
 
     def list_blocks(self, limit: int = 500) -> List[Dict[str, Any]]:
-        return self._get("/v1/blocks", {"limit": limit}) or []
+        return _paginated_get(
+            self, "/v1/blocks", {"limit": limit}, result_key="blocks",
+        ) or []
 
     def agent_archival(self, agent_id: str, limit: int = 1000
                        ) -> List[Dict[str, Any]]:
-        return self._get(
-            f"/v1/agents/{agent_id}/archival-memory", {"limit": limit}
+        return _paginated_get(
+            self,
+            f"/v1/agents/{agent_id}/archival-memory",
+            {"limit": limit},
+            result_key="passages",
         ) or []
 
     def agent_messages(self, agent_id: str, limit: int = 2000
                        ) -> List[Dict[str, Any]]:
-        return self._get(
-            f"/v1/agents/{agent_id}/messages", {"limit": limit}
+        return _paginated_get(
+            self,
+            f"/v1/agents/{agent_id}/messages",
+            {"limit": limit},
+            result_key="messages",
         ) or []
+
+
+def _paginated_get(
+    client: _LettaClient,
+    path: str,
+    params: Dict[str, Any],
+    *,
+    result_key: str,
+    next_token_keys: Tuple[str, ...] = ("after", "next_after", "cursor", "next_cursor", "after_id"),
+) -> List[Dict[str, Any]]:
+    """Walk a paginated Letta list endpoint until exhaustion.
+
+    Letta's REST API uses cursor tokens for pagination on
+    /v1/agents, /v1/blocks, /v1/agents/{id}/archival-memory, and
+    /v1/agents/{id}/messages. The token's name varies by endpoint
+    (``after``, ``next_after``, ``cursor``, ``next_cursor``); we try
+    each in turn and detect a completion signal by either an empty
+    page or the absence of a token in the response. Hard ceiling
+    at 1000 pages to prevent infinite loops on misbehaving servers.
+    """
+    out: List[Dict[str, Any]] = []
+    seen_tokens: set = set()
+    next_token: Optional[str] = None
+    page_size = max(int(params.get("limit", 100) or 100), 1)
+    for _ in range(1000):
+        page_params = dict(params)
+        if next_token:
+            page_params["after"] = next_token
+        payload = client._get(path, page_params) or {}
+        page = payload.get(result_key) if isinstance(payload, dict) else None
+        if not isinstance(page, list):
+            break
+        out.extend(page)
+        if not page:
+            break
+        # Try every common cursor-token field name in priority order;
+        # first non-empty one wins.
+        token: Optional[str] = None
+        for tk in next_token_keys:
+            val = payload.get(tk) if isinstance(payload, dict) else None
+            if val:
+                token = str(val)
+                break
+        if not token:
+            break
+        # Loop guard: same token twice means the server is echoing
+        # back an unchanging cursor (broken pagination). Stop.
+        if token in seen_tokens:
+            break
+        seen_tokens.add(token)
+        next_token = token
+    if len(out) >= 1000 * page_size:
+        # Hit the safety ceiling — signal so the caller can decide.
+        raise SystemExit(
+            f"Letta {path} pagination exceeded 1000 pages; "
+            "the server may not be honouring the cursor parameter."
+        )
+    return out
 
 
 def _server_iter_all(

@@ -109,6 +109,17 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
         for subject, payload, msg_id in nats_intents:
             await _nats_publish_event(subject, payload, msg_id=msg_id)
 
+        # Post-mutation cache invalidation: bump the visibility epoch
+        # so any in-flight search cache reads at the old epoch are
+        # orphaned, and drop the legacy stats:global key. The legacy
+        # delete-only path missed the search caches (up to five minutes
+        # of stale hits) and the MCP principal cache; the canonical
+        # epoch helper closes both windows.
+        try:
+            await _lc._vis_epoch_get_incr()
+        except Exception:
+            logger.debug("visibility epoch bump failed", exc_info=True)
+
         if _lc._cache:
             try:
                 await _lc._cache.delete("stats:global")

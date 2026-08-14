@@ -71,6 +71,13 @@ class DoclingImporter:
         self.collected: list[dict] = []
         self.post_successes = 0
         self.post_failures = 0
+        # Tracks files the operator asked us to ingest whose text
+        # extraction failed (e.g. corrupt PDF, unsupported variant).
+        # Distinct from post_failures (HTTP POST errors) — both must
+        # contribute to a nonzero exit code so the operator sees the
+        # failed import instead of an apparently-successful zero-row
+        # run.
+        self.extraction_failures = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -103,6 +110,7 @@ class DoclingImporter:
             raise
         except Exception as exc:
             print(f"  ERROR  {path.name}: {exc}")
+            self.extraction_failures += 1
             return []
 
         memories = []
@@ -566,7 +574,12 @@ def main(argv=None):
             sys.exit(1)
         memories = importer.import_file(path)
         total = len(memories)
-        print(f"\nResult: {total} chunk(s) processed from {path.name}")
+        suffix = (
+            f" (extraction FAILED for {path.name})"
+            if importer.extraction_failures
+            else ""
+        )
+        print(f"\nResult: {total} chunk(s) processed from {path.name}{suffix}")
     else:
         path = Path(args.source)
         if not path.is_dir():
@@ -580,7 +593,7 @@ def main(argv=None):
         print(f"\nMIF bundle: {args.emit_mif}  concepts={manifest['count']}  "
               f"mif_version={manifest['mif_version']}  schema={manifest['schema']}")
 
-    return 1 if importer.post_failures else 0
+    return 1 if (importer.post_failures or importer.extraction_failures) else 0
 
 
 if __name__ == "__main__":

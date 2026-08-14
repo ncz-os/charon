@@ -61,7 +61,18 @@ def test_convert_jsonl_with_sidecar_trailer(tmp_path):
     src.write_text("\n".join(lines), encoding="utf-8")
     out = tmp_path / "bundle"
 
-    manifest = mpf_to_mif.convert(str(src), str(out))
+    # By default, an input that carries unsupported CHARON sidecars is
+    # refused — the trailer would silently drop kg_triples, which is
+    # data loss. Operators must opt in via --drop-unsupported-sidecars
+    # (the new flag added in the fix).
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="kg_triples"):
+        mpf_to_mif.convert(str(src), str(out))
+
+    # Opt-in: conversion proceeds with sidecars dropped.
+    manifest = mpf_to_mif.convert(
+        str(src), str(out), drop_unsupported_sidecars=True
+    )
     assert manifest["count"] == 2
 
 

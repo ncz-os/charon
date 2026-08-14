@@ -8,6 +8,8 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
+from fastapi import HTTPException
+
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.core.secret_detection import redact
 from mnemos.db import portability_repo as repo
@@ -50,12 +52,28 @@ async def _import_kg_triples(
 
     for entry in sidecar:
         if entry.get("metadata"):
-            _bump(stats.sidecars_failed, surface)
-            stats.errors.append(
-                f"[{surface}] {entry.get('id', '<missing id>')}: metadata is not "
-                "supported by KG persistence; skipped"
+            # The kg_triples persistence layer has no metadata column
+            # and the bundled schema permits metadata as a free-form
+            # extension slot emitted by Graphiti/Cognee. Graphiti
+            # direct migrations would otherwise reject every edge,
+            # leaving previously-batched records committed without
+            # their graph. Rather than silently drop the metadata
+            # (data loss) or partially skip the edge (records
+            # committed but graph lost), fail the entire migration
+            # before committing any records. Operators must either
+            # strip metadata from the envelope or pre-upgrade the
+            # target's kg_triples schema to a metadata column.
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"[{surface}] {entry.get('id', '<missing id>')}: "
+                    "kg_triples metadata is not supported by CHARON "
+                    "kg persistence; refusing the entire migration to "
+                    "avoid committing records without their graph. "
+                    "Strip metadata from the envelope or upgrade the "
+                    "target's kg_triples schema to a metadata column."
+                ),
             )
-            continue
         if not entry.get("id") or not entry.get("predicate"):
             _bump(stats.sidecars_failed, surface)
             stats.errors.append(f"[{surface}] missing required id/predicate; skipped")
@@ -473,6 +491,15 @@ async def _import_compression_manifest(
                     winner_id = None
             try:
                 async with conn.transaction():
+                    # Reject unresolved winner references instead of silently
+                    # nulling them: a non-null winner_contest_id whose
+                    # candidate row is absent from this DB means the import
+                    # cannot preserve the winner/lineage invariant, and a
+                    # nulled winner would round-trip as a different lineage
+                    # on a later export. The compression_candidates sidecar
+                    # (when supplied) is imported by _import_compression_candidates
+                    # before this function runs, so an absent candidate here
+                    # is genuinely missing.
                     if winner_id is not None:
                         exists = await repo.compression_candidate_exists(
                             conn,
@@ -481,7 +508,16 @@ async def _import_compression_manifest(
                             owner_id=row_owner,
                         )
                         if not exists:
-                            winner_id = None
+                            _bump(stats.sidecars_failed, surface)
+                            stats.errors.append(
+                                f"[{surface}] {entry['record_id']}: "
+                                "winner_contest_id references a candidate row "
+                                f"({winner_id}) that is not present in this "
+                                "import. Ship a compression_candidates "
+                                "sidecar that covers it, or omit "
+                                "winner_contest_id."
+                            )
+                            continue
                     row = await repo.insert_compressed_variant(
                         conn,
                         memory_id=entry["record_id"],

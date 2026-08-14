@@ -28,7 +28,8 @@ from .schemas import (
     ImportStats,
     MPFEnvelope,
 )
-from .timestamps import _parse_iso_naive
+from .serializers import _MPF_V0_2_RECORD_FIELDS_METADATA_KEY
+from .timestamps import MalformedTimestampError, _parse_iso_naive
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,45 @@ async def import_memories(
                 rejected_persisted_ids.add(record.id)
                 continue
             metadata = dict(metadata)
+            # MPF v0.2 record-level fields (provenance, valid_time_*,
+            # transaction_time) are sibling-of-payload per the v0.2 spec
+            # but the memories schema has no first-class columns for
+            # them. Persist them as explicitly-untrusted imported data
+            # under payload.metadata so a round-trip re-export restores
+            # them via the serializer bridge — without ever letting them
+            # authenticate identity or attribution. If the envelope's
+            # payload.metadata already carries a customer-owned value at
+            # the bridge key, the importer preserves that customer value
+            # AND stores the imported v0.2 envelope fields at a sibling
+            # sub-key so they survive the round-trip; without the sibling
+            # sub-key the v0.2 fields would be silently dropped on
+            # re-export (the export side reconstructs from row columns
+            # rather than the bridge).
+            record_level_v02: Dict[str, Any] = {}
+            if envelope.mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
+                if record.provenance is not None:
+                    record_level_v02["provenance"] = record.provenance
+                if record.valid_time_start is not None:
+                    record_level_v02["valid_time_start"] = record.valid_time_start
+                if record.valid_time_end is not None:
+                    record_level_v02["valid_time_end"] = record.valid_time_end
+                if record.transaction_time is not None:
+                    record_level_v02["transaction_time"] = record.transaction_time
+            if record_level_v02:
+                if _MPF_V0_2_RECORD_FIELDS_METADATA_KEY not in metadata:
+                    # Customer hasn't claimed the bridge key — store the
+                    # v0.2 fields there.
+                    metadata[_MPF_V0_2_RECORD_FIELDS_METADATA_KEY] = record_level_v02
+                else:
+                    # Customer owns the bridge key with their own value.
+                    # Preserve the customer value AND persist the imported
+                    # v0.2 envelope fields at a sibling sub-key so they
+                    # survive a re-export round-trip instead of being
+                    # silently dropped (asserted by
+                    # test_import_does_not_replace_customer_metadata_with_v02_bridge
+                    # — the customer value is preserved verbatim; the
+                    # imported v0.2 fields are stored at the sibling key).
+                    metadata[_MPF_V0_2_RECORD_FIELDS_METADATA_KEY + "_imported_envelope"] = record_level_v02
             quality_rating = p.get("quality_rating")
             if quality_rating is None:
                 quality_rating = 75
@@ -348,24 +388,42 @@ async def import_memories(
                 else:
                     stats.imported += 1
                     inserted_record_ids.add(persisted_id)
-                    if backend is not None and tx is not None:
-                        await _write_mpf_import_audit_entry(
-                            conn,
-                            backend,
-                            tx,
-                            memory_id=persisted_id,
-                            content=content,
-                            category=category,
-                            subcategory=subcategory,
-                            metadata=metadata,
-                            writer_id=user.user_id,
-                        )
             except Exception as exc:
                 stats.failed += 1
                 stats.errors.append(f"{record.id}: {type(exc).__name__}: {exc}")
                 logger.exception("MPF import failed for record %s", record.id)
                 id_remap.pop(record.id, None)
                 rejected_persisted_ids.add(persisted_id)
+                continue
+
+            # Audit write happens OUTSIDE the insert try/except. An
+            # enabled audit chain must fail the entire import (rolled
+            # back via the outer transaction) so memory mutations
+            # don't commit with permanent gaps in the tamper-evident
+            # chain. Catching audit failures here would let the
+            # memory row land while the chain is silently incomplete.
+            if (
+                inserted_record_ids
+                and backend is not None
+                and tx is not None
+            ):
+                # The insert above only adds to inserted_record_ids on
+                # the non-conflict path. The audit write needs the
+                # memory_id, content, category, subcategory, metadata
+                # for the row that just landed; recompute them via the
+                # current record iteration to keep the call self-contained.
+                last_inserted = persisted_id
+                await _write_mpf_import_audit_entry(
+                    conn,
+                    backend,
+                    tx,
+                    memory_id=last_inserted,
+                    content=content,
+                    category=category,
+                    subcategory=subcategory,
+                    metadata=metadata,
+                    writer_id=user.user_id,
+                )
 
         if id_remap:
             for entry in envelope.kg_triples or []:
@@ -559,31 +617,33 @@ async def _write_mpf_import_audit_entry(
         return
     session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
     if not session_secret:
-        logger.warning("[mpf_import] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write")
-        return
-    try:
-        # asyncpg implements a nested transaction as a savepoint.  Audit is
-        # optional, but write_audit_entry must re-raise so a failed statement
-        # rolls back to this savepoint instead of leaving the outer import
-        # transaction aborted.
-        async with conn.transaction():
-            await write_audit_entry(
-                backend,
-                tx,
-                op="create",
-                memory_id_str=memory_id,
-                content=content,
-                category=category,
-                subcategory=subcategory,
-                metadata=metadata,
-                embedding=None,
-                writer_id=writer_id,
-                session_secret=session_secret,
-                enforce_continuity=True,
-            )
-    except Exception:
-        logger.warning(
-            "Optional MPF import audit write failed for record %s",
-            memory_id,
-            exc_info=True,
+        # An enabled audit chain with no configured session_secret would
+        # write a tampered/unsignable entry — that's a configuration
+        # bug, not an optional degradation. Refuse the import so the
+        # operator notices and either fixes the secret or disables the
+        # chain explicitly (the disabled path is taken above).
+        raise RuntimeError(
+            "MNEMOS_AUDIT_CHAIN is enabled but session_secret is empty; "
+            "refusing to import without a signing secret (set "
+            "MNEMOS_SESSION_SECRET or unset MNEMOS_AUDIT_CHAIN)."
+        )
+    # asyncpg implements a nested transaction as a savepoint. An audit
+    # write failure re-raises so the inner savepoint rolls back AND
+    # propagates out of the outer import transaction — without this,
+    # memory mutations would commit with permanent gaps in the
+    # configured tamper-evident chain.
+    async with conn.transaction():
+        await write_audit_entry(
+            backend,
+            tx,
+            op="create",
+            memory_id_str=memory_id,
+            content=content,
+            category=category,
+            subcategory=subcategory,
+            metadata=metadata,
+            embedding=None,
+            writer_id=writer_id,
+            session_secret=session_secret,
+            enforce_continuity=True,
         )

@@ -896,9 +896,31 @@ def test_import_does_not_replace_customer_metadata_with_v02_bridge(monkeypatch):
     assert stats.imported == 1
     insert_args = next(args for sql, args in conn.executes if "INSERT INTO memories" in sql)
     metadata = __import__("json").loads(insert_args[4])
-    assert metadata == {
-        "_mnemos_charon_mpf_v0_2_record_fields": "customer-owned-value"
-    }
+    # Customer-owned value at the bridge key is preserved verbatim —
+    # the importer must NOT overwrite customer metadata.
+    assert (
+        metadata["_mnemos_charon_mpf_v0_2_record_fields"]
+        == "customer-owned-value"
+    )
+    # The imported v0.2 envelope fields are persisted at a sibling
+    # sub-key so they survive a re-export round-trip rather than
+    # being silently dropped (the export side reconstructs from row
+    # columns, not the bridge, so a record whose customer value
+    # collides with the bridge key would otherwise lose the imported
+    # v0.2 fields on round-trip).
+    assert (
+        metadata["_mnemos_charon_mpf_v0_2_record_fields_imported_envelope"]
+        == {
+            "provenance": {
+                "wasAttributedTo": {"type": "user", "id": "alice"},
+                "wasGeneratedBy": {"type": "activity", "id": "job-1"},
+                "generatedAtTime": "2026-08-10T00:00:00Z",
+            },
+            "valid_time_start": "2026-08-09T00:00:00Z",
+            "valid_time_end": "2026-08-11T00:00:00Z",
+            "transaction_time": "2026-08-10T00:00:00Z",
+        }
+    )
 
 
 def test_import_rejects_unimplemented_v02_deletion_log(monkeypatch):
@@ -1029,7 +1051,7 @@ def test_import_rejects_invalid_permission_and_quality_values(
     assert all("INSERT INTO memories" not in sql for sql, _ in conn.executes)
 
 
-def test_import_optional_audit_failure_isolated_from_memory_insert(monkeypatch):
+def test_import_enabled_audit_chain_failure_aborts_memory_import(monkeypatch):
     from mnemos.domain.portability import import_ as import_domain
     import mnemos.audit as audit_module
     import mnemos.core.config as config_module
@@ -1067,19 +1089,20 @@ def test_import_optional_audit_failure_isolated_from_memory_insert(monkeypatch):
     backend = type("Backend", (), {"audit_chain": object()})()
     tx = object()
 
-    stats = asyncio.run(
-        import_domain.import_memories(
-            conn,
-            envelope=_envelope([_memory_record()]),
-            preserve_owner=False,
-            user=_alice(),
-            backend=backend,
-            tx=tx,
+    # An enabled audit chain must propagate write failures out of the
+    # import so the outer transaction rolls back rather than committing
+    # with a tamper-evident gap.
+    with pytest.raises(RuntimeError, match="audit table unavailable"):
+        asyncio.run(
+            import_domain.import_memories(
+                conn,
+                envelope=_envelope([_memory_record()]),
+                preserve_owner=False,
+                user=_alice(),
+                backend=backend,
+                tx=tx,
+            )
         )
-    )
-
-    assert stats.imported == 1
-    assert stats.failed == 0
     assert RuntimeError in conn.transaction_exits
 
 
@@ -1123,7 +1146,6 @@ def test_import_audit_helper_requests_failure_propagation(monkeypatch):
     [
         (False, True, "secret"),
         (True, False, "secret"),
-        (True, True, ""),
     ],
 )
 def test_import_audit_disabled_paths_do_not_open_savepoint(
@@ -1161,6 +1183,43 @@ def test_import_audit_disabled_paths_do_not_open_savepoint(
             writer_id="alice",
         )
     )
+
+
+def test_import_audit_enabled_without_secret_refuses_to_write(monkeypatch):
+    """An enabled audit chain with no configured session_secret is a
+    configuration bug that would write unsignable entries; the helper
+    refuses to import rather than silently skip the write."""
+    from mnemos.domain.portability import import_ as import_domain
+    import mnemos.audit as audit_module
+    import mnemos.core.config as config_module
+    import mnemos.workers.audit_sealer as audit_sealer_module
+
+    async def _unexpected_write(*args, **kwargs):
+        raise AssertionError(
+            "refused-write path must NOT call write_audit_entry"
+        )
+
+    settings = type(
+        "Settings", (), {"server": type("Server", (), {"session_secret": ""})()}
+    )()
+    monkeypatch.setattr(audit_module, "write_audit_entry", _unexpected_write)
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(audit_sealer_module, "audit_chain_enabled", lambda: True)
+
+    with pytest.raises(RuntimeError, match="session_secret"):
+        asyncio.run(
+            import_domain._write_mpf_import_audit_entry(
+                _Conn(),
+                type("Backend", (), {"audit_chain": object()})(),
+                object(),
+                memory_id="mem_1",
+                content="body",
+                category="solutions",
+                subcategory=None,
+                metadata={},
+                writer_id="alice",
+            )
+        )
 
 
 def test_import_wrong_mpf_version_returns_415(monkeypatch):
@@ -2159,7 +2218,12 @@ def test_import_no_sidecars_means_no_sidecar_inserts(monkeypatch):
     )
 
 
-def test_import_reports_kg_metadata_as_failed_instead_of_discarding_it(monkeypatch):
+def test_import_kg_metadata_aborts_entire_migration(monkeypatch):
+    """A kg_triple carrying metadata cannot be silently dropped
+    (records would commit without their graph) or partially skipped
+    (graph lost). The import must fail closed BEFORE any records
+    commit so the operator either strips metadata or upgrades the
+    target's kg_triples schema to a metadata column."""
     conn = _Conn()
     _install(monkeypatch, conn)
     triple = _kg_sidecar_entry(id="cognee-edge-1")
@@ -2167,17 +2231,21 @@ def test_import_reports_kg_metadata_as_failed_instead_of_discarding_it(monkeypat
     triple["metadata"] = {"cognee": {"edge_properties": {"rank": 1}}}
     env = portability.MPFEnvelope(records=[], kg_triples=[triple])
 
-    stats = asyncio.run(
-        portability.import_memories(
-            envelope=env,
-            preserve_owner=False,
-            user=_alice(),
-        )
-    )
+    from fastapi import HTTPException
 
-    assert stats.sidecars_failed == {"kg_triples": 1}
-    assert stats.sidecars_imported == {}
-    assert "metadata is not supported" in stats.errors[0]
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            portability.import_memories(
+                envelope=env,
+                preserve_owner=False,
+                user=_alice(),
+            )
+        )
+    assert exc.value.status_code == 415
+    assert "kg_triples metadata" in exc.value.detail
+    # No INSERT against memories or kg_triples must have happened —
+    # the whole transaction must roll back.
+    assert not any("INSERT INTO memories" in sql for sql, _ in conn.executes)
     assert not any("INSERT INTO kg_triples" in sql for sql, _ in conn.executes)
 
 
@@ -3122,6 +3190,28 @@ def test_topo_sort_treats_external_parents_as_roots(monkeypatch):
     sorted_entries = portability._topo_sort_versions([orphan])
     assert len(sorted_entries) == 1
     assert sorted_entries[0]["id"] == orphan["id"]
+
+
+def test_topo_sort_rejects_duplicate_version_ids(monkeypatch):
+    """Round-N finding: a duplicate id in the memory_versions sidecar
+    used to silently overwrite the earlier entry in the by_id
+    dictionary, so one authoritative history entry disappeared before
+    validation. The function must fail closed instead."""
+    entry_a = {
+        **_mv_sidecar_entry(),
+        "id": "00000000-0000-0000-0000-0000000000aa",
+        "version_num": 1,
+        "content": "earlier authoritative content",
+    }
+    entry_b = {
+        **_mv_sidecar_entry(),
+        "id": "00000000-0000-0000-0000-0000000000aa",  # same id
+        "version_num": 2,
+        "content": "later content (would silently overwrite)",
+    }
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="duplicate"):
+        portability._topo_sort_versions([entry_a, entry_b])
 
 
 def test_import_memory_versions_handles_v2_before_v1(monkeypatch):

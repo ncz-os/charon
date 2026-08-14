@@ -44,6 +44,22 @@ MEMORY_PAYLOAD_VERSION = "mnemos-3.1"
 SOURCE_SYSTEM = "memory_export"
 
 
+# Complete set of MPF envelope sidecar arrays (CHARON v0.2). Used
+# by both the JSON and JSONL exporters to ensure every populated
+# sidecar round-trips. Keep in sync with MPFEnvelope in
+# mnemos.domain.portability.schemas.
+SIDECAR_KEYS = (
+    "kg_triples",
+    "relations",
+    "memory_versions",
+    "compression_manifest",
+    "compression_candidates",
+    "embeddings",
+    "attestations",
+    "deletion_log",
+)
+
+
 def _fetch_export(
     endpoint: str,
     api_key: Optional[str],
@@ -53,12 +69,33 @@ def _fetch_export(
     namespace: Optional[str] = None,
     include_sidecars: bool = False,
     include_unattached_kg: bool = False,
+    *,
+    paginate: bool = True,
 ) -> Dict[str, Any]:
     """Call ``GET /v1/export`` and return the MPF envelope as a dict.
 
-    The server-side handler already returns an MPF envelope with
-    ``records[*].kind == "memory"`` and ``payload_version`` set; this
-    function only manages the HTTP round-trip.
+    The server-side handler caps each request at ``_EXPORT_HARD_LIMIT``
+    (10_000 memories). To make a full-corpus export actually full,
+    this helper paginates with ``offset`` until either the server
+    returns a short page (fewer than ``limit`` records) or no further
+    records. ``--limit`` continues to be honored as the per-page
+    batch size; it is NOT a cap on the total export size. The CLI's
+    default ``--limit`` matches the server cap so the first request
+    in a paginated run is the largest the server allows.
+
+    Sidecar behavior across pages: the server emits sidecars on the
+    page bound to the requested slice; for paginated runs we carry
+    the FIRST page's sidecars into the final envelope and ignore
+    sidecars on later pages (the same tenant scope applies, so
+    re-fetching them on each page would be redundant).
+
+    The ``deletion_log_next_cursor`` field on the final envelope is
+    the LAST non-empty cursor observed; callers paginating
+    deletion_log independently can resume from it.
+
+    Pass ``paginate=False`` to get the legacy single-request shape
+    (one HTTP call, no offset loop) — used by callers that need the
+    raw server response (e.g. ``mpf_to_mif`` style tools).
 
     With ``include_sidecars=True`` the envelope also carries the
     `kg_triples`, `memory_versions`, and `compression_manifest`
@@ -66,41 +103,86 @@ def _fetch_export(
     default stays False so existing scripts emit unchanged envelopes.
     """
     endpoint = endpoint.rstrip("/")
-    params: Dict[str, str] = {"limit": str(limit)}
-    if category:
-        params["category"] = category
-    if owner_id:
-        params["owner_id"] = owner_id
-    if namespace:
-        params["namespace"] = namespace
-    if include_sidecars:
-        params["include_sidecars"] = "true"
-        # CLI default matches HTTP default (false). Common CLI
-        # use case is a sliced export (--category, --limit), where
-        # tenant-wide first-class kg_triples would leak unrelated
-        # facts. Migration / full-corpus export is the rarer case
-        # and opts in explicitly via --include-unattached-kg.
-        if include_unattached_kg:
-            params["include_unattached_kg"] = "true"
-    url = f"{endpoint}/v1/export?{urllib.parse.urlencode(params)}"
-
     headers: Dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, headers=headers, method="GET")
 
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")[:300]
-        raise SystemExit(f"ERROR: /v1/export HTTP {exc.code}: {body}")
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"ERROR: /v1/export connection: {exc.reason}")
+    def _do_request(offset: int) -> Dict[str, Any]:
+        params: Dict[str, str] = {"limit": str(limit), "offset": str(offset)}
+        if category:
+            params["category"] = category
+        if owner_id:
+            params["owner_id"] = owner_id
+        if namespace:
+            params["namespace"] = namespace
+        if include_sidecars:
+            params["include_sidecars"] = "true"
+            if include_unattached_kg:
+                params["include_unattached_kg"] = "true"
+        url = f"{endpoint}/v1/export?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:300]
+            raise SystemExit(f"ERROR: /v1/export HTTP {exc.code}: {body}")
+        except urllib.error.URLError as exc:
+            raise SystemExit(f"ERROR: /v1/export connection: {exc.reason}")
 
+    # First page always.
+    payload = _do_request(0)
     if not isinstance(payload, dict) or "records" not in payload:
         raise SystemExit("ERROR: /v1/export did not return an MPF envelope")
 
+    if not paginate:
+        return payload
+
+    records: List[Dict[str, Any]] = list(payload.get("records") or [])
+    # Preserve sidecars from the first page only — subsequent pages
+    # in the pagination loop are bound to partial record slices and
+    # would re-emit the same tenant-wide sidecars redundantly.
+    preserved_sidecars: Dict[str, Any] = {
+        k: payload.get(k)
+        for k in ("kg_triples", "memory_versions", "compression_manifest", "deletion_log")
+        if payload.get(k)
+    }
+    last_cursor = payload.get("deletion_log_next_cursor")
+
+    # Paginate until the server returns a short page. We walk the
+    # offset forward by the size of each non-empty page. A page with
+    # fewer than `limit` records signals exhaustion; a page with
+    # exactly `limit` records may have more rows past it, so we keep
+    # looping until the response is short.
+    offset = len(records)
+    safety_iterations = 0
+    while records and len(records) % limit == 0:
+        safety_iterations += 1
+        # Hard ceiling on pagination rounds to prevent runaway loops
+        # when a server misbehaves and never returns a short page.
+        # 10_000 rounds × 10_000 page size = 100M memories, well past
+        # any realistic CHARON corpus.
+        if safety_iterations > 10_000:
+            raise SystemExit(
+                f"ERROR: /v1/export pagination exceeded 10,000 pages; "
+                "the server may not be honouring the limit parameter."
+            )
+        page = _do_request(offset)
+        if not isinstance(page, dict):
+            break
+        page_records = list(page.get("records") or [])
+        if not page_records:
+            break
+        records.extend(page_records)
+        offset += len(page_records)
+        if page.get("deletion_log_next_cursor"):
+            last_cursor = page["deletion_log_next_cursor"]
+
+    payload["records"] = records
+    for k, v in preserved_sidecars.items():
+        payload[k] = v
+    if last_cursor:
+        payload["deletion_log_next_cursor"] = last_cursor
     return payload
 
 
@@ -143,7 +225,7 @@ def cmd_json(args: argparse.Namespace) -> None:
                    encoding="utf-8")
     n = len(envelope.get("records") or [])
     extras = []
-    for key in ("kg_triples", "memory_versions", "compression_manifest"):
+    for key in SIDECAR_KEYS:
         sidecar = envelope.get(key)
         if sidecar:
             extras.append(f"{key}={len(sidecar)}")
@@ -172,8 +254,7 @@ def cmd_jsonl(args: argparse.Namespace) -> None:
         # include_sidecars is set. Importers reading the file as JSONL
         # see a normal record-per-line stream until the final line,
         # which is the trailer keyed by mpf_sidecars=true.
-        sidecar_keys = ("kg_triples", "memory_versions", "compression_manifest")
-        sidecars = {k: envelope.get(k) for k in sidecar_keys if envelope.get(k)}
+        sidecars = {k: envelope.get(k) for k in SIDECAR_KEYS if envelope.get(k)}
         if sidecars:
             trailer = {"mpf_sidecars": True, **sidecars}
             f.write(json.dumps(trailer, ensure_ascii=False))

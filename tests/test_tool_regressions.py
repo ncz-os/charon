@@ -77,6 +77,25 @@ def test_docling_main_returns_failure_when_a_post_fails(tmp_path, monkeypatch):
     assert docling_import.main(["--file", str(source)]) == 1
 
 
+def test_docling_main_returns_failure_when_extraction_fails(tmp_path, monkeypatch):
+    """An extraction failure (corrupt PDF, unsupported variant) must
+    bump extraction_failures and force a nonzero exit so the operator
+    sees the failed import instead of an apparently-successful zero-row
+    run."""
+    from pathlib import Path
+    source = tmp_path / "doc.pdf"
+    source.write_bytes(b"%PDF")
+
+    def _failed_extraction(self, path: Path):
+        self.extraction_failures += 1
+        return []
+
+    monkeypatch.setattr(
+        docling_import.DoclingImporter, "import_file", _failed_extraction
+    )
+    assert docling_import.main(["--file", str(source)]) == 1
+
+
 @pytest.mark.parametrize("adapter", [letta, mem0, cognee, graphiti])
 def test_direct_adapter_post_normalizes_non_memory_records(adapter, monkeypatch):
     captured = []

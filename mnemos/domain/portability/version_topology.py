@@ -64,12 +64,30 @@ def _topo_sort_versions(sidecar: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     by_id: Dict[str, Dict[str, Any]] = {}
     no_id: List[Dict[str, Any]] = []
+    # Reject duplicate memory-version IDs before sorting. Silently
+    # letting the later entry overwrite the earlier one in `by_id`
+    # (the prior bug) caused one authoritative history entry to
+    # disappear before validation and from import statistics. The
+    # envelope is fail-closed: the caller surfaces the conflict and
+    # the operator must dedupe the sidecar before re-running.
+    duplicates: List[str] = []
     for entry in sidecar:
         eid = entry.get("id")
         if eid:
-            by_id[str(eid)] = entry
+            sid = str(eid)
+            if sid in by_id:
+                duplicates.append(sid)
+                continue
+            by_id[sid] = entry
         else:
             no_id.append(entry)
+    if duplicates:
+        raise ValueError(
+            "memory_versions sidecar contains duplicate id(s): "
+            + ", ".join(sorted(set(duplicates)))
+            + ". Dedupe the sidecar before re-running; silent overwrite "
+            "would drop an authoritative history entry."
+        )
 
     in_degree: Dict[str, int] = {eid: 0 for eid in by_id}
     children: Dict[str, List[str]] = {eid: [] for eid in by_id}

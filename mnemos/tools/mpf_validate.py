@@ -83,10 +83,18 @@ def _full_check(env: Any, schema: Any) -> List[str]:
     """Run the full JSON Schema validation via the jsonschema package."""
     try:
         from jsonschema.validators import Draft202012Validator
+        # JSON Schema's `format` keyword (date-time, email, uri, ...) is
+        # advisory by default; without a FormatChecker, `format: date-time`
+        # in the bundled schema accepts invalid values like
+        # "2026-13-40T99:99:99Z". Wire the format checkers in so
+        # `date-time` is actually validated (a sidecar that round-trips
+        # a malformed value would otherwise reach the DB layer and be
+        # silently coerced to None or to NOW).
+        from jsonschema import FormatChecker
     except ImportError as exc:
         return [f"schema validation unavailable: {exc}"]
     try:
-        validator = Draft202012Validator(schema)
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
     except Exception as exc:
         return [f"schema load error: {exc}"]
     errs: List[str] = []

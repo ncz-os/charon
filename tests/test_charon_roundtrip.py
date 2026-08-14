@@ -251,9 +251,10 @@ async def _snapshot(pool) -> Dict[str, Any]:
             SEED_MEMORY_ID,
         )
         variants = await conn.fetch(
-            "SELECT memory_id, owner_id, engine_id, engine_version, "
-            "compressed_content, compressed_tokens, compression_ratio, "
-            "quality_score, composite_score, scoring_profile, judge_model "
+            "SELECT memory_id, owner_id, winner_candidate_id, engine_id, "
+            "engine_version, compressed_content, compressed_tokens, "
+            "compression_ratio, quality_score, composite_score, "
+            "scoring_profile, judge_model "
             "FROM memory_compressed_variants WHERE memory_id = $1",
             SEED_MEMORY_ID,
         )

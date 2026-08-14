@@ -10,8 +10,23 @@ Nothing in this module makes network calls or carries a default host/key —
 bring your own.
 """
 from datetime import datetime
+from html import escape as _html_escape
 from pathlib import Path
 from typing import List, Dict, Any
+
+
+def _esc(value: Any) -> str:
+    """HTML-escape a dynamic field for safe insertion into the export.
+
+    All values inserted into the HTML output must go through this helper
+    so a stored <script> tag or event-handler payload cannot execute
+    when the exported document is opened. Non-string values are coerced
+    via str() first; ``None`` and missing values are passed through so
+    the caller can supply a fallback label.
+    """
+    if value is None:
+        return ""
+    return _html_escape(str(value), quote=True)
 
 
 def export_memories_markdown(memories: List[Dict[str, Any]], output_file: Path) -> None:
@@ -69,20 +84,26 @@ def export_memories_html(memories: List[Dict[str, Any]], output_file: Path) -> N
         f.write("</style>\n")
         f.write("</head>\n<body>\n")
         f.write("<h1>MNEMOS Memory Export</h1>\n")
-        f.write(f"<p>Exported: {datetime.now().isoformat()}</p>\n")
+        f.write(f"<p>Exported: {_esc(datetime.now().isoformat())}</p>\n")
         f.write(f"<p>Total memories: {len(memories)}</p>\n")
 
         for mem in memories:
             f.write("<div class='memory'>\n")
-            f.write(f"<div class='memory-id'>{mem.get('id', 'Unknown')}</div>\n")
+            f.write(f"<div class='memory-id'>{_esc(mem.get('id', 'Unknown'))}</div>\n")
             f.write("<div class='memory-meta'>\n")
-            f.write(f"Category: {mem.get('category', 'N/A')}<br/>\n")
+            f.write(f"Category: {_esc(mem.get('category', 'N/A'))}<br/>\n")
             if mem.get('subcategory'):
-                f.write(f"Subcategory: {mem.get('subcategory')}<br/>\n")
-            f.write(f"Created: {mem.get('created', 'N/A')}\n")
+                f.write(f"Subcategory: {_esc(mem.get('subcategory'))}<br/>\n")
+            f.write(f"Created: {_esc(mem.get('created', 'N/A'))}\n")
             f.write("</div>\n")
             f.write("<div class='memory-content'>\n")
-            f.write(mem.get('content', '(empty)'))
+            # Wrap content in a <pre> so the white-space CSS rule applies
+            # AFTER escaping, not before. Escape is mandatory even though
+            # the wrapping is structural — a stored </pre> in user content
+            # would otherwise escape the block.
+            f.write("<pre>")
+            f.write(_esc(mem.get('content', '(empty)')))
+            f.write("</pre>\n")
             f.write("</div>\n")
             f.write("</div>\n")
 

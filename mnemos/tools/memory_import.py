@@ -50,6 +50,23 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+# Complete set of MPF envelope sidecar arrays (CHARON v0.2). The
+# passthrough path forwards every one of these to /v1/import so the
+# server can fail-closed on individual sidecars instead of having
+# the client silently flatten them to records. Keep in sync with
+# MPFEnvelope in mnemos.domain.portability.schemas.
+_SIDECAR_KEYS = (
+    "kg_triples",
+    "relations",
+    "memory_versions",
+    "compression_manifest",
+    "compression_candidates",
+    "embeddings",
+    "attestations",
+    "deletion_log",
+)
+
+
 def _stable_id_from_mem(mem: dict) -> str:
     """Derive a deterministic, content-addressed id for a memory dict
     that came in without one. Hashing the canonical payload keeps
@@ -309,7 +326,7 @@ class BaseImporter:
                 print(f"  DRY RUN  id={mem.get('id')!r}  content={preview!r}")
             sidecar_summary = ", ".join(
                 f"{k}={len(self.source_envelope.get(k) or [])}"
-                for k in ("kg_triples", "memory_versions", "compression_manifest")
+                for k in _SIDECAR_KEYS
                 if self.source_envelope.get(k)
             )
             if sidecar_summary:
@@ -432,8 +449,7 @@ class JsonImporter(BaseImporter):
                     # passthrough path picks them up.
                     if (isinstance(parsed, dict)
                             and parsed.get("mpf_sidecars") is True):
-                        for k in ("kg_triples", "memory_versions",
-                                  "compression_manifest"):
+                        for k in _SIDECAR_KEYS:
                             arr = parsed.get(k)
                             if isinstance(arr, list) and arr:
                                 jsonl_sidecars[k] = arr
@@ -580,21 +596,19 @@ class JsonImporter(BaseImporter):
             # version-snapshot-trigger guard to scope correctly.
             has_sidecars = any(
                 isinstance(data.get(k), list) and data.get(k)
-                for k in ("kg_triples", "memory_versions", "compression_manifest")
+                for k in _SIDECAR_KEYS
             )
             if has_sidecars and self.preserve_metadata:
                 self.source_envelope = data
             elif has_sidecars and not self.preserve_metadata:
                 # Symmetric with the JSONL trailer warning — the
                 # records-only path can't carry sidecars, so we'd
-                # silently drop kg_triples / memory_versions /
-                # compression_manifest. Emit a loud warning so the
+                # silently drop them. Emit a loud warning so the
                 # operator knows their export+import round-trip
                 # lost data (Codex round-27 finding). Mirror's the
                 # JSONL trailer-without-preserve-metadata warning.
                 kinds = ", ".join(
-                    k for k in
-                    ("kg_triples", "memory_versions", "compression_manifest")
+                    k for k in _SIDECAR_KEYS
                     if data.get(k)
                 )
                 print(
