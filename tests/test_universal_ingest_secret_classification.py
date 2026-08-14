@@ -166,7 +166,10 @@ async def test_route_search_default_discovers_vaulted_secret_redacted(sqlite_bac
 
 
 def test_credential_record_detector_shape():
-    finding = classify("🔑 Credential: ssh mini@192.168.207.66 sudo password = 'mini'")
+    # Obviously-fake host and password: this module ships in a published
+    # sdist, so a fixture must never carry a real credential or real internal
+    # topology just to exercise the detector.
+    finding = classify("🔑 Credential: ssh svc@host.invalid sudo password = 'FakePw@NotReal1'")
     assert finding.cls is SecretClass.VAULT
     assert finding.spans
 
