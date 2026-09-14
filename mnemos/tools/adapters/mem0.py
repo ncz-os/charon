@@ -522,9 +522,11 @@ def _iter_platform_records(
     2. **Non-advancing-page backstop.** Even if a future SDK claims
        to support pagination but echoes the same page back, we keep
        a frozen set of the previous page's IDs and stop the loop the
-       moment we see an unchanged page. This is the same pattern
-       that F08's earlier pagination fix used for the sidecar-
-       aggregation path in this codebase.
+       moment we see an unchanged page. This is the defensive
+       pattern a non-advancing-cursor guard uses regardless of
+       which SDK version is installed — it's the safety net that
+       catches the case where a "paginated" SDK silently ignores
+       the ``page`` argument and returns the full set every call.
     """
     if MemoryClient is None:
         raise SystemExit(
