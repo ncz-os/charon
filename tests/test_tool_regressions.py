@@ -346,3 +346,271 @@ def test_mif_preserve_metadata_keeps_recovered_fields(monkeypatch, tmp_path):
     assert row["updated"] == "2026-01-02T00:00:00+00:00"
     assert row["permission_mode"] == 640
     assert row["source_provider"] == "mif-source"
+
+
+# ─── F13: Letta adapter must accept BOTH bare-array and wrapped response shapes
+# ─────────────────────────────────────────────────────────────
+
+
+class _StubLettaClient:
+    """Drop-in stand-in for _LettaClient used by _paginated_get tests.
+
+    Only ``_get`` is exercised; it just returns whatever's queued up
+    for the next call. The bare-array / wrapped-envelope distinction
+    is the whole point of the F13 fix, so the queue contents are
+    what actually matter for each test.
+    """
+
+    def __init__(self, responses):
+        # ``responses`` is a list of bodies; _get pops one per call.
+        self._responses = list(responses)
+        self.calls = []
+
+    def _get(self, path, params=None):
+        self.calls.append((path, params))
+        if not self._responses:
+            return None
+        return self._responses.pop(0)
+
+
+def test_letta_paginated_get_handles_bare_array_response():
+    """Letta documents a bare-array shape on some endpoints/SDK
+    versions: ``GET /v1/agents`` returns ``[{...}, {...}]`` directly,
+    NOT ``{"agents": [...]}``. The old adapter treated a non-dict
+    payload as "no items" and silently exported zero rows. This
+    test exercises that shape with real data and asserts the items
+    come through.
+    """
+    body = [
+        {"id": "agent-1", "name": "alpha"},
+        {"id": "agent-2", "name": "beta"},
+        {"id": "agent-3", "name": "gamma"},
+    ]
+    client = _StubLettaClient([body])
+    rows = letta._paginated_get(client, "/v1/agents", {}, result_key="agents")
+    assert len(rows) == 3
+    assert [r["id"] for r in rows] == ["agent-1", "agent-2", "agent-3"]
+
+
+def test_letta_paginated_get_handles_wrapped_envelope_response():
+    """The wrapped envelope shape (``{"agents": [...], "after": "..."}``)
+    must keep working after F13 — backwards compatibility for the
+    older callers that still get the envelope back.
+    """
+    body = {
+        "agents": [{"id": "agent-1"}, {"id": "agent-2"}],
+        "after": "cursor-page-2",
+    }
+    client = _StubLettaClient([body, {"agents": [{"id": "agent-3"}]}])
+    rows = letta._paginated_get(client, "/v1/agents", {}, result_key="agents")
+    assert [r["id"] for r in rows] == ["agent-1", "agent-2", "agent-3"]
+
+
+def test_letta_paginated_get_raises_on_unrecognised_object_shape():
+    """If the response is a JSON object but lacks the ``result_key``
+    field (error envelope, schema change, typo), the adapter MUST
+    raise rather than silently returning an empty list. "We don't
+    understand this response" should never look like "zero items."
+    """
+    client = _StubLettaClient([{"error": "oops", "detail": "nope"}])
+    with pytest.raises(letta._LettaResponseShapeError) as excinfo:
+        letta._paginated_get(client, "/v1/agents", {}, result_key="agents")
+    # The error should mention what we expected and what we got.
+    msg = str(excinfo.value)
+    assert "agents" in msg
+    assert "/v1/agents" in msg
+
+
+def test_letta_paginated_get_raises_on_unrecognised_primitive_shape():
+    """A scalar / null body is also unrecognised and must raise
+    rather than silently empty. This covers the "server returned a
+    message we can't parse" case (string, number, null).
+    """
+    client = _StubLettaClient([None])
+    with pytest.raises(letta._LettaResponseShapeError):
+        letta._paginated_get(client, "/v1/agents", {}, result_key="agents")
+
+    client = _StubLettaClient(["<html>some non-json thing</html>"])
+    with pytest.raises(letta._LettaResponseShapeError):
+        letta._paginated_get(client, "/v1/agents", {}, result_key="agents")
+
+
+def test_letta_paginated_get_stops_after_bare_array_page():
+    """The bare-array shape has no documented cursor — there is no
+    way to advance — so the loop must NOT keep calling the server
+    looking for a ``after``/``cursor`` field. One call, one page,
+    done. (Without this guard, a server echoing back a stale
+    cursor on every wrapped call would already be bounded by the
+    seen_tokens guard; for bare arrays there's nothing to guard
+    against, but the loop must still terminate.)"""
+    body = [{"id": "agent-1"}, {"id": "agent-2"}]
+    client = _StubLettaClient([body])
+    rows = letta._paginated_get(client, "/v1/agents", {}, result_key="agents")
+    assert len(rows) == 2
+    assert len(client.calls) == 1
+
+
+# ─── F14: Mem0 adapter must not loop forever on legacy nonpaginated get_all()
+# ─────────────────────────────────────────────────────────────
+
+
+class _LegacyMem0Client:
+    """Stand-in for the OLD mem0ai ``MemoryClient``: ``get_all()``
+    takes no arguments and returns the FULL set every call. Used to
+    reproduce the 250-rows-from-100-unique-records bug."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = []
+
+    def get_all(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        # Raise TypeError on pagination kwargs (legacy SDK behaviour:
+        # the function signature genuinely doesn't accept those names).
+        if "page" in kwargs or "page_size" in kwargs:
+            raise TypeError(
+                "get_all() got an unexpected keyword argument 'page'"
+            )
+        # Returning the SAME rows every call is the legacy behaviour
+        # that causes the original loop bug.
+        return self._rows
+
+
+class _PaginatedMem0Client:
+    """Stand-in for the NEWER mem0ai ``MemoryClient``: ``get_all``
+    accepts ``page`` and ``page_size`` kwargs and returns only the
+    requested slice. Used to verify the paginated path still works
+    after F14 and to drive the non-advancing-page backstop."""
+
+    def __init__(self, pages):
+        # ``pages``: list of pages, each a list of dicts.
+        self._pages = list(pages)
+        self.calls = []
+
+    def get_all(self, *args, page=1, page_size=100, **kwargs):
+        self.calls.append({"page": page, "page_size": page_size})
+        idx = page - 1
+        if idx >= len(self._pages):
+            return []
+        page_rows = self._pages[idx]
+        return page_rows[:page_size]
+
+
+class _EchoingPaginatedMem0Client:
+    """A pathological paginated client that always returns the
+    SAME page no matter what ``page`` argument is passed. Exercises
+    the non-advancing-page backstop."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = []
+
+    def get_all(self, *args, page=1, page_size=100, **kwargs):
+        self.calls.append({"page": page, "page_size": page_size})
+        # Return the same rows regardless of page — broken server.
+        return self._rows
+
+
+def _mem0_iter_with_client(client_instance):
+    """Run ``mem0._iter_platform_records`` against a fake
+    ``MemoryClient``. The real function calls ``MemoryClient(...)``
+    directly, so we monkeypatch the module attribute (which is a
+    class) with a callable that returns the supplied fake instance."""
+    saved = mem0.MemoryClient
+
+    class _Factory:
+        def __new__(cls, *args, **kwargs):
+            return client_instance
+
+    mem0.MemoryClient = _Factory
+    try:
+        rows = list(
+            mem0._iter_platform_records(
+                "irrelevant", tenancy_axis="owner_id", page_size=100
+            )
+        )
+    finally:
+        mem0.MemoryClient = saved
+    return rows, client_instance
+
+
+def test_mem0_legacy_get_all_called_exactly_once():
+    """Reproduces the F14 bug: legacy ``get_all()`` returns the
+    FULL set every call. The old loop would call it until it ran
+    out of pages, yielding 250 rows from 100 unique records. The
+    fixed path must call the no-kwargs form ``get_all()`` exactly
+    ONCE (yielding 100 records) — no duplicates. The pagination-
+    kwargs probe that fires ``TypeError`` is a separate first call
+    and is asserted in
+    ``test_mem0_legacy_get_all_raises_typeerror_then_stops``."""
+    rows_payload = [
+        {"id": f"mem-{i}", "memory": f"row {i}"} for i in range(100)
+    ]
+    client = _LegacyMem0Client(rows_payload)
+    rows, _ = _mem0_iter_with_client(client)
+    assert len(rows) == 100
+    assert [r["id"] for r in rows] == [f"mem-{i}" for i in range(100)]
+    # Exactly 1 call to the legacy no-kwargs form — that's the
+    # bug fix. (The probe call with pagination kwargs is separate.)
+    legacy_calls = [c for c in client.calls if not c[1]]
+    assert len(legacy_calls) == 1
+
+
+def test_mem0_paginated_get_all_walks_pages_until_short_page():
+    """Sanity check: the modern paginated path must still work
+    after F14. Two full pages followed by a short page should
+    yield all three pages' worth of records and then stop on the
+    short page, not the backstop.
+    """
+    page1 = [{"id": f"mem-{i}", "memory": f"row {i}"} for i in range(100)]
+    page2 = [{"id": f"mem-{i}", "memory": f"row {i}"} for i in range(100, 200)]
+    page3 = [{"id": "mem-200", "memory": "tail"}]  # short page
+    client = _PaginatedMem0Client([page1, page2, page3])
+    rows, _ = _mem0_iter_with_client(client)
+    assert len(rows) == 201
+    assert rows[-1]["id"] == "mem-200"
+
+
+def test_mem0_non_advancing_page_backstop_stops_loop():
+    """The non-advancing-page backstop must terminate the loop
+    even if a (broken) paginated client keeps returning the same
+    100 rows for every page. Without it, the loop would advance
+    the page counter forever (or until some unrelated ceiling);
+    with it, we stop the second time we see the same IDs."""
+    rows_payload = [
+        {"id": f"mem-{i}", "memory": f"row {i}"} for i in range(100)
+    ]
+    client = _EchoingPaginatedMem0Client(rows_payload)
+    rows, _ = _mem0_iter_with_client(client)
+    # Exactly the records from one page, no duplicates.
+    assert len(rows) == 100
+    # And we don't keep hammering the server: two calls (page 1
+    # accepted, page 2 caught by the backstop). Anything more than
+    # a small constant means the backstop isn't doing its job.
+    assert len(client.calls) <= 3
+
+
+def test_mem0_legacy_get_all_raises_typeerror_then_stops():
+    """Direct test of the F14 detection contract: when the SDK
+    rejects pagination kwargs with ``TypeError`` (i.e. it's a legacy
+    nonpaginated SDK), the adapter must call ``get_all()`` EXACTLY
+    ONCE on the no-kwargs form and yield the unique rows exactly
+    once. This is the integration-level counterpart to the bare
+    mock-based test above and exercises the actual TypeError branch
+    in the code.
+    """
+    rows_payload = [
+        {"id": f"mem-{i}", "memory": f"row {i}"} for i in range(100)
+    ]
+    client = _LegacyMem0Client(rows_payload)
+    rows, _ = _mem0_iter_with_client(client)
+    assert len(rows) == 100
+    assert [r["id"] for r in rows] == [f"mem-{i}" for i in range(100)]
+    # The first call attempted pagination kwargs and got TypeError.
+    # Subsequent calls (if any) would be on the no-kwargs form.
+    # Exactly 1 call to the legacy no-kwargs form.
+    legacy_calls = [c for c in client.calls if not c[1]]
+    assert len(legacy_calls) == 1
+    # And only one pagination-kwarg attempt.
+    paged_calls = [c for c in client.calls if "page" in c[1]]
+    assert len(paged_calls) == 1

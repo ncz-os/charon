@@ -202,6 +202,12 @@ class _LettaClient:
         ) or []
 
 
+class _LettaResponseShapeError(RuntimeError):
+    """Raised when a Letta endpoint returns a body this adapter does not
+    recognise. An unrecognised shape must never be silently reported as
+    "zero items" — that hides data loss behind a successful export."""
+
+
 def _paginated_get(
     client: _LettaClient,
     path: str,
@@ -219,6 +225,15 @@ def _paginated_get(
     each in turn and detect a completion signal by either an empty
     page or the absence of a token in the response. Hard ceiling
     at 1000 pages to prevent infinite loops on misbehaving servers.
+
+    Response shape compatibility: Letta documents BOTH a wrapped
+    envelope shape (``{"<items>": [...], "after": "..."}``) and a
+    bare-array shape (``[{...}, {...}]``) across the versions this
+    adapter targets. A bare-array body MUST be treated as the item
+    list directly. Any body shape that is neither a dict with
+    ``<items>`` nor a list is treated as a hard error — silently
+    returning an empty list on a server we don't understand would
+    export "zero rows" instead of "we don't know what's there."
     """
     out: List[Dict[str, Any]] = []
     seen_tokens: set = set()
@@ -228,22 +243,45 @@ def _paginated_get(
         page_params = dict(params)
         if next_token:
             page_params["after"] = next_token
-        payload = client._get(path, page_params) or {}
-        page = payload.get(result_key) if isinstance(payload, dict) else None
-        if not isinstance(page, list):
-            break
+        payload = client._get(path, page_params)
+        # Shape dispatch. See docstring above for the two supported
+        # shapes; everything else is a fail-loud error.
+        if isinstance(payload, list):
+            page = payload
+            token: Optional[str] = None
+        elif isinstance(payload, dict):
+            raw_page = payload.get(result_key)
+            if not isinstance(raw_page, list):
+                # Dict body but no <result_key> array: the response
+                # is something we don't recognise (could be an error
+                # envelope, a schema change, or a typo). Fail loudly
+                # instead of pretending the page is empty.
+                raise _LettaResponseShapeError(
+                    f"Letta {path} returned a JSON object without an"
+                    f" '{result_key}' array; cannot determine items."
+                    f" Got keys: {sorted(payload.keys())}"
+                )
+            page = raw_page
+            token = None
+            for tk in next_token_keys:
+                val = payload.get(tk)
+                if val:
+                    token = str(val)
+                    break
+        else:
+            raise _LettaResponseShapeError(
+                f"Letta {path} returned a body of type"
+                f" {type(payload).__name__!r}; expected a JSON object"
+                f" with '{result_key}' or a bare JSON array."
+            )
         out.extend(page)
         if not page:
             break
-        # Try every common cursor-token field name in priority order;
-        # first non-empty one wins.
-        token: Optional[str] = None
-        for tk in next_token_keys:
-            val = payload.get(tk) if isinstance(payload, dict) else None
-            if val:
-                token = str(val)
-                break
-        if not token:
+        # No cursor tokens exist on a bare-array page — there's no
+        # documented way to advance, so we stop. (This is the
+        # documented Letta behaviour for the bare-array shape: the
+        # server returns everything it has in one shot.)
+        if token is None:
             break
         # Loop guard: same token twice means the server is echoing
         # back an unchanging cursor (broken pagination). Stop.

@@ -495,6 +495,36 @@ def _iter_platform_records(
     Uses MemoryClient.get_all() with pagination. The hosted platform
     exposes 'categories' in addition to OSS fields — we preserve them
     under metadata.mem0.categories.
+
+    Pagination compatibility note (F14):
+    Newer mem0ai SDKs accept ``get_all(page=..., page_size=...)`` and
+    return each page on demand. Older SDKs expose only ``get_all()``
+    with no pagination kwargs — calling that returns the FULL set
+    every time. The legacy ``TypeError`` branch below used to call
+    ``get_all()`` in a loop and stop when ``len(rows) < page_size``,
+    but a legacy ``get_all()`` ignores the ``page_size`` request and
+    returns every record each call, so the loop sees a full page
+    forever and the same rows get yielded over and over (250 rows
+    from 100 unique records was reproduced on real data).
+
+    Two complementary guards now make this safe regardless of which
+    SDK version is installed:
+
+    1. **Legacy-mode detection via TypeError.** The first call to
+       ``get_all(page=1, page_size=...)`` either succeeds (paginated
+       SDK) or raises ``TypeError`` for legacy SDKs that don't accept
+       those kwargs. We latch the answer the first time we try, and
+       if the legacy path was taken we call ``get_all()`` EXACTLY
+       ONCE and stop. The legacy form returns the full memory set on
+       every call, so a loop here is guaranteed to re-yield the same
+       rows.
+
+    2. **Non-advancing-page backstop.** Even if a future SDK claims
+       to support pagination but echoes the same page back, we keep
+       a frozen set of the previous page's IDs and stop the loop the
+       moment we see an unchanged page. This is the same pattern
+       that F08's earlier pagination fix used for the sidecar-
+       aggregation path in this codebase.
     """
     if MemoryClient is None:
         raise SystemExit(
@@ -502,74 +532,123 @@ def _iter_platform_records(
             "  pip install mem0ai"
         )
     client = MemoryClient(api_key=api_key)
-    page = 1
-    while True:
+
+    # F14: Decide ONCE whether pagination is supported. The legacy
+    # mem0ai SDK exposes ``get_all()`` with no pagination kwargs;
+    # passing ``page=.../page_size=...`` to it raises ``TypeError``.
+    # We latch the result of the first call so every subsequent call
+    # goes through the latched branch — and so the legacy mode calls
+    # ``get_all()`` exactly once instead of looping forever.
+    pagination_supported: Optional[bool] = None
+
+    def _fetch_one(current_page: int) -> List[Dict[str, Any]]:
+        """Call ``get_all`` once and return the raw row list.
+
+        Side effect on first call: latches ``pagination_supported``
+        to record whether this SDK accepts pagination kwargs. After
+        latch, every call goes through the latched branch.
+        """
+        nonlocal pagination_supported
         try:
-            batch = client.get_all(page=page, page_size=page_size)
+            raw = client.get_all(page=current_page, page_size=page_size)
+            pagination_supported = True
         except TypeError:
-            # Older SDK without pagination kwargs
-            batch = client.get_all()
-        if not batch:
-            return
-        # Normalize: SDK may return a list or {"results": [...]}
-        rows: List[Dict[str, Any]]
-        if isinstance(batch, dict):
-            rows = batch.get("results") or batch.get("memories") or []
-        else:
-            rows = list(batch)
+            pagination_supported = False
+            raw = client.get_all()
+        if isinstance(raw, dict):
+            return raw.get("results") or raw.get("memories") or []
+        return list(raw)
+
+    # First call decides the mode. In legacy mode we emit that
+    # single batch and stop — the legacy ``get_all()`` returns the
+    # full memory set on every invocation, so any loop here is
+    # guaranteed to re-yield the same rows.
+    rows = _fetch_one(1)
+    if pagination_supported is False:
+        for row in rows:
+            yield _platform_row_to_record(row, tenancy_axis=tenancy_axis)
+        return
+
+    # Paginated path — walk pages until exhaustion.
+    page = 1
+    prev_page_ids: Optional[frozenset] = None
+    while True:
         if not rows:
             return
+
+        # Defensive non-advancing-page backstop. A genuine next page
+        # will share few if any IDs with the previous one; if a page
+        # is IDENTICAL to the previous one, the server is echoing and
+        # we should stop before re-yielding duplicates. (Frozen set
+        # keeps the comparison cheap.)
+        page_ids = frozenset(str(r.get("id") or "") for r in rows)
+        if prev_page_ids is not None and page_ids == prev_page_ids:
+            return
+        prev_page_ids = page_ids
+
         for row in rows:
-            pid = str(row.get("id") or "")
-            content = row.get("memory") or row.get("data") or ""
-            memory_type = row.get("memory_type")
-            user_id = row.get("user_id")
-            agent_id = row.get("agent_id")
-            run_id = row.get("run_id")
-            created = row.get("created_at")
-            updated = row.get("updated_at")
-            categories = row.get("categories")
-
-            payload: Dict[str, Any] = {
-                "content": content,
-                "category": "memory",
-            }
-            if memory_type:
-                payload["subcategory"] = memory_type
-            if created:
-                payload["created"] = created
-            if updated:
-                payload["updated"] = updated
-
-            tenancy = _composite_tenancy(user_id, agent_id, run_id)
-            if tenancy_axis == "namespace":
-                payload["namespace"] = tenancy
-            else:
-                payload["owner_id"] = tenancy
-
-            payload["metadata"] = {
-                "mem0": {
-                    "point_id": pid,
-                    "memory_type": memory_type,
-                    "user_id": user_id,
-                    "agent_id": agent_id,
-                    "run_id": run_id,
-                    "categories": categories,
-                    "platform": True,
-                    "raw": row,
-                }
-            }
-
-            yield {
-                "id": pid,
-                "kind": "memory",
-                "payload_version": PAYLOAD_VERSION_MNEMOS,
-                "payload": payload,
-            }
+            yield _platform_row_to_record(row, tenancy_axis=tenancy_axis)
         # Stop when the SDK returned fewer than a full page.
         if len(rows) < page_size:
             return
         page += 1
+        rows = _fetch_one(page)
+
+
+def _platform_row_to_record(
+    row: Dict[str, Any],
+    *,
+    tenancy_axis: str,
+) -> Dict[str, Any]:
+    """Map one mem0 Platform row to an MPF record. Split out so the
+    legacy one-shot path and the paginated loop share the same
+    normalisation (and so we can unit-test the mapping directly)."""
+    pid = str(row.get("id") or "")
+    content = row.get("memory") or row.get("data") or ""
+    memory_type = row.get("memory_type")
+    user_id = row.get("user_id")
+    agent_id = row.get("agent_id")
+    run_id = row.get("run_id")
+    created = row.get("created_at")
+    updated = row.get("updated_at")
+    categories = row.get("categories")
+
+    payload: Dict[str, Any] = {
+        "content": content,
+        "category": "memory",
+    }
+    if memory_type:
+        payload["subcategory"] = memory_type
+    if created:
+        payload["created"] = created
+    if updated:
+        payload["updated"] = updated
+
+    tenancy = _composite_tenancy(user_id, agent_id, run_id)
+    if tenancy_axis == "namespace":
+        payload["namespace"] = tenancy
+    else:
+        payload["owner_id"] = tenancy
+
+    payload["metadata"] = {
+        "mem0": {
+            "point_id": pid,
+            "memory_type": memory_type,
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "categories": categories,
+            "platform": True,
+            "raw": row,
+        }
+    }
+
+    return {
+        "id": pid,
+        "kind": "memory",
+        "payload_version": PAYLOAD_VERSION_MNEMOS,
+        "payload": payload,
+    }
 
 
 # ─── Streaming envelope assembly ─────────────────────────────────────────────
