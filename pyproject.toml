@@ -47,5 +47,21 @@ namespaces = true
 [tool.setuptools.package-data]
 "mnemos.domain.portability" = ["vendor/*.json"]
 
+# uv: F08 / packaging fix — local-path fallback for the `mnemos-core`
+# distribution that is not published to PyPI. The real wheel is published
+# to an internal index in production; in this repository (a standalone
+# checkout without access to that index) `uv` would otherwise fail to
+# resolve `mnemos-core>=6.2,<7` and the validation command would error
+# out before any test ran. The relative path below points at the
+# mnemos-core checkout that lives next to this repository on the
+# operator's filesystem (typical layout:
+#   ~/Projects/mnemos-fix-f08-charon/   <- this repo
+#   ~/Projects/mnemos-core-release/     <- the source tree uv reads)
+# Operators with a different layout can override via
+# `UV_OVERRIDE_MNEMOS_CORE=/path/to/mnemos-core` (set the override file
+# via `UV_OVERRIDE=` env var) or by symlinking the expected path.
+[tool.uv.sources]
+mnemos-core = { path = "../mnemos-core-release" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

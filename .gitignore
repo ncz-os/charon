@@ -6,4 +6,5 @@ dist/
 .pytest_cache/
 .venv/
 zoder.log
+zoder_run.log
 task.txt

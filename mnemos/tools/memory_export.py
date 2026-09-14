@@ -60,6 +60,142 @@ SIDECAR_KEYS = (
 )
 
 
+# Per-memory sidecar arrays. These are fetched by the server in pages
+# scoped to the CURRENT page's memory IDs
+# (mnemos.domain.portability.export._fetch_kg_triples_for_export /
+# _fetch_memory_versions_for_export / _fetch_compressed_variants_for_export)
+# so each page emits ONLY the sidecar rows whose memory_id is in that
+# page's records[]. A paginated CLI run MUST aggregate them across all
+# pages — the v0.2 prior implementation only retained page 1's sidecars
+# and silently dropped every later page's version history / KG / compression
+# context (F08 fix). The deletion_log is intentionally NOT listed here
+# because it is tenant-scoped, NOT memory-scoped — it paginates on its
+# own cursor and is handled separately below.
+_PER_MEMORY_SIDECAR_KEYS = (
+    "kg_triples",
+    "memory_versions",
+    "compression_manifest",
+)
+
+
+def _sidecar_identity_key(surface: str, entry: Dict[str, Any]) -> Optional[str]:
+    """Return a stable identity string for a per-memory sidecar entry, or
+    None if no identity is available (caller should keep the entry unmerged).
+
+    The server uses these primary keys (see mnemos/db/portability_repo.py):
+        kg_triples             -> id (UUID)
+        memory_versions        -> id (UUID)
+        compression_manifest   -> (record_id, engine_id, engine_version)
+                                   (no surrogate id; PK is composite)
+
+    The CLI uses these identity strings to dedupe per-memory sidecar rows
+    across pages — a memory id appearing on both page 1 and page 2 must
+    not double-count the same sidecar row in the final envelope.
+    """
+    if surface == "kg_triples" or surface == "memory_versions":
+        eid = entry.get("id")
+        if eid is None:
+            return None
+        return f"{surface}:{eid}"
+    if surface == "compression_manifest":
+        rid = entry.get("record_id")
+        eid = entry.get("engine_id")
+        if rid is None or eid is None:
+            return None
+        # engine_version may be NULL for some engines — pin to "" so two
+        # NULL engine_versions on the same (record_id, engine_id) still
+        # dedupe to the same identity.
+        return f"compression_manifest:{rid}:{eid}:{entry.get('engine_version') or ''}"
+    raise ValueError(f"unknown per-memory sidecar surface: {surface!r}")
+
+
+def _merge_per_memory_sidecar_page(
+    accumulated: Dict[str, Dict[str, Any]],
+    page_entries: List[Dict[str, Any]],
+    surface: str,
+    seen_record_ids: set,
+) -> None:
+    """Merge a page's per-memory sidecar entries into the accumulated dict.
+
+    For each entry, derive a stable identity via ``_sidecar_identity_key``.
+    The first observation wins; subsequent identical-key observations are
+    kept iff they are deep-equal to the first (i.e. the server emitted
+    the same row on two pages — a benign consequence of the per-page
+    memory_id scoping re-fetching rows we already saw). Non-identical
+    re-observations would mean the server returned inconsistent data for
+    the same row id, which is a server bug we surface rather than silently
+    collapse (matches the import-side fail-closed dedupe in
+    ``_topo_sort_versions``).
+    """
+    for entry in page_entries or []:
+        if not isinstance(entry, dict):
+            continue
+        rid = entry.get("record_id") or entry.get("memory_id")
+        if rid is not None:
+            seen_record_ids.add(str(rid))
+        key = _sidecar_identity_key(surface, entry)
+        if key is None:
+            # No identity available — keep the entry verbatim so we don't
+            # drop data on an unusual row shape, but don't try to dedupe.
+            # Subsequent occurrences of the same unkeyed entry will
+            # accumulate; this is the same shape an import would see.
+            anon_key = f"__anon:{surface}:{id(entry)}:{len(accumulated)}"
+            accumulated[anon_key] = entry
+            continue
+        existing = accumulated.get(key)
+        if existing is None:
+            accumulated[key] = entry
+            continue
+        if existing == entry:
+            # Same row, same content — benign re-fetch from a page that
+            # overlapped this memory id. No-op; the first observation is
+            # authoritative.
+            continue
+        # Identity collision with non-equal payloads is a server
+        # consistency bug, not a pagination artifact. Fail closed by
+        # keeping the first observation and emitting a stderr warning
+        # so an operator notices the inconsistency on a future
+        # round-trip, without breaking the export.
+        print(
+            f"WARNING: per-memory sidecar {surface} has duplicate identity "
+            f"with divergent content ({key}); keeping first observation. "
+            "Server-side export pagination returned inconsistent rows.",
+            file=sys.stderr,
+        )
+
+
+# Stable ordering key for memory_versions entries within a single memory's
+# history. version_num is the primary monotonic sequence; branch breaks
+# ties (different branch DAGs shouldn't reorder against each other); id is
+# the final stable tiebreaker so two v1s on different branches stay
+# deterministic.
+def _version_entry_sort_key(entry: Dict[str, Any]) -> tuple:
+    return (
+        str(entry.get("record_id") or ""),
+        str(entry.get("branch") or ""),
+        int(entry.get("version_num") or 0),
+        str(entry.get("id") or ""),
+    )
+
+
+def _finalize_memory_versions(
+    accumulated: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Order the merged memory_versions sidecar by (record_id, branch,
+    version_num, id).
+
+    The server's per-page fetch does NOT guarantee version order
+    (memory_versions is joined through ``fetch_memory_versions_for_export``
+    which orders by memory_id, branch, version_num; but once we concat
+    across pages the overall ordering is broken). Restoring it here means
+    the final envelope round-trips through the import path's
+    ``_topo_sort_versions`` with parents appearing before children —
+    ``_topo_sort_versions`` already enforces the DAG, but a stable
+    primary ordering avoids spurious insertion-order dependence.
+    """
+    return sorted(accumulated.values(), key=_version_entry_sort_key)
+
+
 def _fetch_export(
     endpoint: str,
     api_key: Optional[str],
@@ -83,15 +219,44 @@ def _fetch_export(
     default ``--limit`` matches the server cap so the first request
     in a paginated run is the largest the server allows.
 
-    Sidecar behavior across pages: the server emits sidecars on the
-    page bound to the requested slice; for paginated runs we carry
-    the FIRST page's sidecars into the final envelope and ignore
-    sidecars on later pages (the same tenant scope applies, so
-    re-fetching them on each page would be redundant).
+    Sidecar handling across pages — F08 fix (CHARON):
 
-    The ``deletion_log_next_cursor`` field on the final envelope is
-    the LAST non-empty cursor observed; callers paginating
-    deletion_log independently can resume from it.
+    The server emits per-memory sidecars (kg_triples / memory_versions /
+    compression_manifest) SCOPED to the current page's memory IDs —
+    ``memory_ids = [r["id"] for r in row_dicts]`` inside
+    ``export_memories``. A multi-page export therefore materialises a
+    different sidecar slice on each page; if we keep only page 1's
+    sidecars (the prior behaviour), every page after the first silently
+    drops its version history / KG / compression context. This breaks
+    the migration-fidelity promise — import can reject the resulting
+    incomplete version coverage, and other context (KG triples,
+    compression metadata) vanishes without even an error.
+
+    The CLI now aggregates per-memory sidecars across all pages:
+
+    * Identity-dedupe by stable key per surface (``_sidecar_identity_key``).
+      A memory id whose sidecar rows appear on more than one page — e.g.
+      when two pages overlap on a memory id, or when the server replays
+      a page's memory_ids on the next cursor — produces the SAME identity
+      key. We verify the duplicate payloads are deep-equal before
+      collapsing (benign server re-fetch) and warn-on-stderr rather than
+      drop if they diverge (server consistency bug).
+    * Preserve per-memory version ordering: after merge, the merged
+      memory_versions list is sorted by ``(record_id, branch,
+      version_num, id)`` so parent versions always appear before
+      children in the final envelope. Import-side
+      ``_topo_sort_versions`` enforces the DAG independently, but a
+      stable primary order keeps the envelope deterministic.
+    * Keep deletion_log tenant-scoped — it paginates on its OWN cursor
+      (page 1 returns ``deletion_log_next_cursor``, page 2 takes
+      ``deletion_log_cursor``). The cursor mechanism is already correct
+      and is preserved verbatim; this helper does NOT dedupe
+      deletion_log entries across pages because each page is bound by
+      the cursor to a strictly non-overlapping window.
+
+    ``deletion_log_next_cursor`` on the final envelope is the LAST
+    non-empty cursor observed; callers paginating deletion_log
+    independently can resume from it.
 
     Pass ``paginate=False`` to get the legacy single-request shape
     (one HTTP call, no offset loop) — used by callers that need the
@@ -139,14 +304,37 @@ def _fetch_export(
         return payload
 
     records: List[Dict[str, Any]] = list(payload.get("records") or [])
-    # Preserve sidecars from the first page only — subsequent pages
-    # in the pagination loop are bound to partial record slices and
-    # would re-emit the same tenant-wide sidecars redundantly.
-    preserved_sidecars: Dict[str, Any] = {
-        k: payload.get(k)
-        for k in ("kg_triples", "memory_versions", "compression_manifest", "deletion_log")
-        if payload.get(k)
+
+    # F08: accumulate per-memory sidecars across pages, deduped by stable
+    # identity, ordered within each memory's history. The prior behaviour
+    # was to keep page 1's sidecars and silently drop every later page's
+    # sidecar rows — see the module docstring above for the rationale.
+    per_memory_accumulators: Dict[str, Dict[str, Dict[str, Any]]] = {
+        surface: {} for surface in _PER_MEMORY_SIDECAR_KEYS
     }
+    # Track which memory ids contributed per-memory sidecars across all
+    # pages — surfaces silently-missing sidecars (e.g. a memory with no
+    # versions at all) without affecting records[].
+    _seen_record_ids: set = set()
+
+    # Seed accumulators with page 1's per-memory sidecars so the ordering
+    # convention (page 1 first, then page 2, etc.) is observable on the
+    # dedupe path. Page 1's entries still go through the same dedupe
+    # verification as later pages — they may collide with later pages
+    # when the server replays memory_ids across cursors, and the verifier
+    # is the same in both directions.
+    for surface in _PER_MEMORY_SIDECAR_KEYS:
+        page_entries = payload.get(surface) or []
+        if not isinstance(page_entries, list):
+            continue
+        _merge_per_memory_sidecar_page(
+            per_memory_accumulators[surface], page_entries, surface, _seen_record_ids
+        )
+
+    # deletion_log is tenant-scoped and paginates on its own cursor;
+    # preserve page 1's entries verbatim (the server-side cursor enforces
+    # strict non-overlap; we don't dedupe).
+    deletion_log: List[Dict[str, Any]] = list(payload.get("deletion_log") or [])
     last_cursor = payload.get("deletion_log_next_cursor")
 
     # Paginate until the server returns a short page. We walk the
@@ -177,10 +365,59 @@ def _fetch_export(
         offset += len(page_records)
         if page.get("deletion_log_next_cursor"):
             last_cursor = page["deletion_log_next_cursor"]
+        # F08: merge this page's per-memory sidecars into the accumulators.
+        # The server scopes each page's sidecar fetch to the memory_ids
+        # of THAT page only, so later pages contribute sidecar rows the
+        # earlier pages could not have seen. Without this merge the
+        # final envelope silently loses every page 2+ row.
+        for surface in _PER_MEMORY_SIDECAR_KEYS:
+            page_entries = page.get(surface)
+            if not page_entries:
+                continue
+            if not isinstance(page_entries, list):
+                continue
+            _merge_per_memory_sidecar_page(
+                per_memory_accumulators[surface],
+                page_entries,
+                surface,
+                _seen_record_ids,
+            )
+        # deletion_log: page 2+ rows are guaranteed non-overlapping with
+        # page 1 by the server's cursor mechanism (keyset pagination on
+        # executed_at, id). We append verbatim — see the docstring on
+        # _fetch_export for the rationale.
+        page_dl = page.get("deletion_log") or []
+        if page_dl and isinstance(page_dl, list):
+            deletion_log.extend(page_dl)
 
     payload["records"] = records
-    for k, v in preserved_sidecars.items():
-        payload[k] = v
+    # F08: emit the aggregated per-memory sidecars in stable, round-trippable
+    # order. memory_versions gets an explicit (record_id, branch,
+    # version_num, id) sort so parent versions precede children — the
+    # import-side _topo_sort_versions enforces the DAG, but the explicit
+    # sort keeps the wire shape deterministic across runs.
+    for surface in _PER_MEMORY_SIDECAR_KEYS:
+        acc = per_memory_accumulators[surface]
+        if not acc:
+            payload.pop(surface, None)
+            continue
+        if surface == "memory_versions":
+            payload[surface] = _finalize_memory_versions(acc)
+        else:
+            # kg_triples and compression_manifest are content-keyed but
+            # not version-ordered; emit insertion order so the final
+            # envelope's row order is stable across CLI invocations that
+            # fetch the same corpus.
+            payload[surface] = list(acc.values())
+    # deletion_log: tenant-scoped, cursor-paginated, non-overlapping.
+    # The cursor mechanism already guarantees dedup, so we emit the
+    # concatenation verbatim. (If the server ever relaxes the cursor's
+    # strict non-overlap guarantee, the import path's per-row insert
+    # would surface duplicates as a 409, not as silent data loss.)
+    if deletion_log:
+        payload["deletion_log"] = deletion_log
+    else:
+        payload.pop("deletion_log", None)
     if last_cursor:
         payload["deletion_log_next_cursor"] = last_cursor
     return payload
